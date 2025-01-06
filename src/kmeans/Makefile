@@ -6,7 +6,7 @@ CXX = g++
 INCLUDES = -I.
 CFLAG = -O3
 
-TARGETS = kmeans  kmeans_dim kmeans_dim_chunk
+TARGETS = kmeans kmeans_dim kmeans_dim_chunk
 
 OBJS = kmeans.o kmeans_dim.o kmeans_dim_chunk.o
 

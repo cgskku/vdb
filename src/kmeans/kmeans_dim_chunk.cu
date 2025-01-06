@@ -110,7 +110,7 @@ __global__ void kmeans_average_centers_kernel(float* d_clusterCenters, int* d_cl
     }
 }
 
-void launch_kmeans_labeling(
+void launch_kmeans_labeling_chunk(
     float* d_samples, int* d_clusterIndices, 
     float* d_clusterCenters, 
     int N, int TPB, int K, int DIM, int chunkSize) 
@@ -121,7 +121,7 @@ void launch_kmeans_labeling(
         d_samples, d_clusterIndices, d_clusterCenters, N, K, DIM, chunkSize);
 }
 
-void launch_kmeans_update_center(
+void launch_kmeans_update_center_chunk(
     float* d_samples, int* d_clusterIndices, 
     float* d_clusterCenters, int* d_clusterSizes, 
     int N, int TPB, int K, int DIM, int chunkSize

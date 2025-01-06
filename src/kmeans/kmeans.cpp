@@ -56,18 +56,36 @@ int main(int argc, char *argv[])
 {
     std::cout.precision(10);
 
-    if (argc != 6) {
+    if (argc != 5) {
         return 1;
     }
 
     std::size_t N = std::atoi(argv[1]); // Number of data points
-    int TPB = std::atoi(argv[2]); // Threads per block
-    std::size_t K = std::atoi(argv[3]); // Number of clusters
-    int MAX_ITER = std::atoi(argv[4]);
-    std::size_t dimension = std::atoi(argv[5]); // Dimension of data points
+    std::size_t K = std::atoi(argv[2]); // Number of clusters
+    int MAX_ITER = std::atoi(argv[3]);
+    std::size_t dimension = std::atoi(argv[4]); // Dimension of data points
 
     float *d_samples = nullptr, *d_clusterCenters = nullptr;
     int *d_clusterIndices = nullptr, *d_clusterSizes = nullptr;
+
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+
+    size_t maxChunkSize = prop.sharedMemPerBlock / (K * sizeof(float));
+    int chunkSize = (int)maxChunkSize - 1;
+    // chunkSize = (chunkSize / prop.warpSize) * prop.warpSize;
+    int TPB = std::__bit_floor(chunkSize) > prop.maxThreadsPerBlock / 2 ? prop.maxThreadsPerBlock / 2 : std::__bit_floor(chunkSize);
+
+    std::cout << "Device Setting---------------------------------" << std::endl;
+    std::cout << "Device Name: " << prop.name << std::endl;
+    std::cout << "Shared Memory Per Block: " << prop.sharedMemPerBlock << " bytes" << std::endl;
+    std::cout << "Global Memory: " << prop.totalGlobalMem / 1024 / 1024 / 1024 << " GBs" << std::endl;
+    std::cout << "Size of Warp: " << prop.warpSize << std::endl;
+    std::cout << "Max Threads Per Block(TPB): " << prop.maxThreadsPerBlock << std::endl;
+    std::cout << "chunk size: " << chunkSize << std::endl;
+    std::cout << "TPB : " << TPB << std::endl;
+    std::cout << "Get Shared Memory : " << K * chunkSize * sizeof(float) << " bytes" <<  std::endl;
+    std::cout << "-----------------------------------------------" << std::endl;
 
     // Allocate GPU memory
     cudaMalloc(&d_samples, N * dimension * sizeof(float));
@@ -92,18 +110,21 @@ int main(int argc, char *argv[])
     for(int cur_iter = 1; cur_iter <= MAX_ITER; ++cur_iter)
     {
         // Cluster assignment step
-        launch_kmeans_labeling(d_samples, d_clusterIndices, d_clusterCenters, N, TPB, K, dimension);
+        launch_kmeans_labeling(d_samples, d_clusterIndices, d_clusterCenters, N, TPB, K, dimension, chunkSize);
         cudaDeviceSynchronize();
 
         // Centroid update step
-        launch_kmeans_update_center(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, TPB, K, dimension);
+        launch_kmeans_update_center(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, TPB, K, dimension, chunkSize);
         cudaDeviceSynchronize();
 
         cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
         cudaMemcpy(h_clusterCenters.data(), d_clusterCenters, K * dimension * sizeof(float), cudaMemcpyDeviceToHost);
 
-        double sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, dimension);
-        std::cout << "Iteration " << cur_iter << ": SSE = " << sse << std::endl;
+        if(cur_iter % 10 == 0 || cur_iter == 1)
+        {
+            double sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, dimension);
+            std::cout << "Iteration " << cur_iter << " SSE = " << sse << std::endl;
+        }
     }
     cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
     auto end = std::chrono::high_resolution_clock::now();

@@ -77,6 +77,7 @@ __global__ void kmeans_update_centers_kernel(
 {
     extern __shared__ float shardMemory[]; 
     float* sharedPsum = shardMemory;
+    int* sharedClusterSize = (int*)&sharedPsum[K * d_chunkSize];
 
     const int globalThreadIndex = blockIdx.x * blockDim.x + threadIdx.x;
     const int tid = threadIdx.x;
@@ -84,13 +85,16 @@ __global__ void kmeans_update_centers_kernel(
     // Use global device variable for chunkSize
     int chunkSize = d_chunkSize;
 
-    for (int i = tid; i < K * chunkSize; i += blockDim.x) {
-        sharedPsum[i] = 0.0f;
-    }
-    __syncthreads();
-
     for (int offset = 0; offset < DIM; offset += chunkSize) {
         int curChunkSize = min(chunkSize, DIM - offset);
+
+        for(int i = tid; i < K * curChunkSize; i += blockDim.x) {
+            sharedPsum[i] = 0.0f;
+        }
+        for(int i = tid; i < K; i += blockDim.x) {
+            sharedClusterSize[i] = 0;
+        }
+        __syncthreads();
 
         if (globalThreadIndex < N) {
             int cluster_id = d_clusterIndices[globalThreadIndex];
@@ -98,6 +102,7 @@ __global__ void kmeans_update_centers_kernel(
             for (int d = 0; d < curChunkSize; ++d) {
                 atomicAdd(&sharedPsum[cluster_id * curChunkSize + d], curPoint[d]);
             }
+            atomicAdd(&sharedClusterSize[cluster_id], 1);
         }
         __syncthreads();
 
@@ -106,11 +111,11 @@ __global__ void kmeans_update_centers_kernel(
             int d = i % curChunkSize;      
             atomicAdd(&d_clusterCenters[c * DIM + offset + d], sharedPsum[i]);
         }
-        __syncthreads();
-    }
 
-    if (globalThreadIndex < N) {
-        atomicAdd(&d_clusterSizes[d_clusterIndices[globalThreadIndex]], 1);
+        for (int i = tid; i < K; i += blockDim.x) {
+            atomicAdd(&d_clusterSizes[i], sharedClusterSize[i]);
+        }
+        __syncthreads();
     }
 }
 
@@ -137,7 +142,7 @@ void launch_kmeans_update_center(float* d_samples, int* d_clusterIndices, float*
     cudaMemset(d_clusterCenters, 0, K * DIM * sizeof(float));
     cudaMemset(d_clusterSizes, 0, K * sizeof(int));
 
-    int shared_memory_size = K * chunkSize * sizeof(float); // Use chunkSize from host
+    int shared_memory_size = K * chunkSize * sizeof(float) + K * sizeof(int); // Use chunkSize from host
     kmeans_update_centers_kernel<<<(N + TPB - 1) / TPB, TPB, shared_memory_size>>>(
         d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, K, DIM);
     kmeans_average_centers_kernel<<<(K + TPB - 1) / TPB, TPB>>>(d_clusterCenters, d_clusterSizes, K, DIM);

@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 //#include <device_launch_parameter.h>
 #include <math.h>
-#include "kmeans.h"
+#include "kmeans_bank.h"
 #define WARPSIZE 32
 
 __device__ int d_chunkSize = 256;
@@ -10,6 +10,7 @@ __global__ void kmeans_labeling_kernel(
     float* d_samples,
     int* d_clusterIndices,
     float* d_clusterCenters,
+    int *d_clusterSizes,
     int sharedMemSize,
     int N, int K, int DIM
 ) {
@@ -75,6 +76,10 @@ __global__ void kmeans_labeling_kernel(
         }
     }
 
+    if (tid == 0)
+    {
+        atomicAdd(&d_clusterSizes[*cluster_id], 1);
+    }
     d_clusterIndices[blockIdx.x] = *cluster_id;
 }
 
@@ -104,10 +109,10 @@ __global__ void kmeans_update_centers_kernel(float *d_samples, int *d_clusterInd
     const int tid = threadIdx.x;
 
     // Accumulate the coordinates of each data point to the cluster centroid it belongs to
-    if (tid == 0)
-    {
-        atomicAdd(&d_clusterSizes[cluster_id], 1);
-    }
+    // if (tid == 0)
+    // {
+    //     atomicAdd(&d_clusterSizes[cluster_id], 1);
+    // }
 
     for (int i = tid; i < DIM; i += blockDim.x)
     {
@@ -117,7 +122,7 @@ __global__ void kmeans_update_centers_kernel(float *d_samples, int *d_clusterInd
 
     for (int i = tid; i < DIM; i += blockDim.x)
     {
-        atomicAdd(&d_clusterCenters[cluster_id * DIM + i], sharedMemory[i]);
+        atomicAdd(&d_clusterCenters[cluster_id * DIM + i], (sharedMemory[i] / d_clusterSizes[cluster_id]));
     }
 
     __syncthreads();
@@ -156,21 +161,21 @@ __global__ void kmeans_average_centers_kernel(float *d_clusterCenters, int *d_cl
     }
 }
 
-void launch_kmeans_labeling(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, int N, int TPB, int K, int DIM)
+void launch_kmeans_labeling(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, int *d_clusterSizes, int N, int TPB, int K, int DIM)
 {
     int shredMemSize = 8 * sizeof(float) * DIM;
-    kmeans_labeling_kernel<<<N, TPB, shredMemSize>>>(d_samples, d_clusterIndices, d_clusterCenters, shredMemSize,  N, K, DIM);
+    cudaMemset(d_clusterSizes, 0, K * sizeof(int));
+    kmeans_labeling_kernel<<<N, TPB, shredMemSize>>>(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, shredMemSize,  N, K, DIM);
 }
 
 void launch_kmeans_update_center(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, int *d_clusterSizes, int N, int TPB, int K, int DIM)
 {
     cudaMemset(d_clusterCenters, 0, K * DIM * sizeof(float));
-    cudaMemset(d_clusterSizes, 0, K * sizeof(int));
     int sharedMemSize = sizeof(float) * DIM;
 
     kmeans_update_centers_kernel<<<N, TPB, sharedMemSize>>>(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, K, DIM);
     //kmeans_update_centers_kernel<<<N, TPB>>>(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, K, DIM);
-    kmeans_average_centers_kernel<<<(K + TPB - 1) / TPB, TPB>>>(d_clusterCenters, d_clusterSizes, K, DIM);
+    //kmeans_average_centers_kernel<<<(K + TPB - 1) / TPB, TPB>>>(d_clusterCenters, d_clusterSizes, K, DIM);
 }
 
 

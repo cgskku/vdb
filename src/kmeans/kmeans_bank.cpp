@@ -6,7 +6,7 @@
 #include <vector>
 #include <random>
 #include <limits>
-#include "kmeans.h"
+#include "kmeans_bank.h"
 
 #define FileFlag 0
 
@@ -92,7 +92,7 @@ int main(int argc, char *argv[])
     for(int cur_iter = 1; cur_iter <= MAX_ITER; ++cur_iter)
     {
         // Cluster assignment step
-        launch_kmeans_labeling(d_samples, d_clusterIndices, d_clusterCenters, N, TPB, K, dimension);
+        launch_kmeans_labeling(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, TPB, K, dimension);
         cudaDeviceSynchronize();
 
         // Centroid update step
@@ -102,8 +102,8 @@ int main(int argc, char *argv[])
         cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
         cudaMemcpy(h_clusterCenters.data(), d_clusterCenters, K * dimension * sizeof(float), cudaMemcpyDeviceToHost);
 
-        //double sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, dimension);
-        //std::cout << "Iteration " << cur_iter << ": SSE = " << sse << std::endl;
+        double sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, dimension);
+        std::cout << "Iteration " << cur_iter << ": SSE = " << sse << std::endl;
     }
     //cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
     auto end = std::chrono::high_resolution_clock::now();

@@ -3,14 +3,14 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <chrono>
+#include <string.h>
 #include <vector>
 #include <random>
 #include <limits>
-#include "kmeans_bank.h"
+#include "kmeans_mmap.h"
 
-#define FileFlag 1
+#define FileFlag 0
 
-// Function to generate clustered data
 template<typename VecType = float>
 void generate_sample_data(std::vector<VecType>& h_data, std::vector<VecType>& h_clusterCenters, std::size_t N, std::size_t K, std::size_t DIM, std::size_t seed = std::numeric_limits<std::size_t>::max()) {
     std::random_device random_device;
@@ -65,12 +65,21 @@ int main(int argc, char *argv[])
     std::size_t K = std::atoi(argv[3]); // Number of clusters
     int MAX_ITER = std::atoi(argv[4]);
     std::size_t dimension = std::atoi(argv[5]); // Dimension of data points
+    std::size_t n = N / 2;
+    //std::size_t n = std::atoi(argv[6]);
 
-    float *d_samples = nullptr, *d_clusterCenters = nullptr;
+    float *d_clusterCenters = nullptr;
     int *d_clusterIndices = nullptr, *d_clusterSizes = nullptr;
+    float *d_samples = nullptr;
 
-    // Allocate GPU memory
-    cudaMalloc(&d_samples, N * dimension * sizeof(float));
+    float *d_samples_div[2];
+
+    std::vector<float> h_clusterCenters(K * dimension), h_samples(N * dimension);
+    int *h_clusterIndices = (int*)malloc(N * sizeof(int));
+    // read file from sampleFile
+    generate_sample_data(h_samples, h_clusterCenters, N, K, dimension);
+
+    //cudaMalloc(&d_samples, N * dimension * sizeof(float));
     cudaMalloc(&d_clusterIndices, N * sizeof(int));
     cudaMalloc(&d_clusterCenters, K * dimension * sizeof(float));
     cudaMalloc(&d_clusterSizes, K * sizeof(int));
@@ -78,38 +87,58 @@ int main(int argc, char *argv[])
     cudaMemset(d_clusterIndices, -1, N * sizeof(int));
     cudaMemset(d_clusterSizes, 0, K * sizeof(int));
 
-    std::vector<float> h_clusterCenters(K * dimension), h_samples(N * dimension);
-    int *h_clusterIndices = (int*)malloc(N * sizeof(int));
-
-    generate_sample_data(h_samples, h_clusterCenters, N, K, dimension);
-
     cudaMemcpy(d_clusterCenters, h_clusterCenters.data(), K * dimension * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_samples, h_samples.data(), N * dimension * sizeof(float), cudaMemcpyHostToDevice);
+    //cudaMemcpy(d_samples, h_samples.data(), N * dimension * sizeof(float), cudaMemcpyHostToDevice);
 
+    cudaMalloc(&d_samples_div[0], n * dimension * sizeof(float));
+    cudaMalloc(&d_samples_div[1], n * dimension * sizeof(float));
+    cudaMalloc(&d_samples, N * dimension * sizeof(float));
+    float *h_samples_div = (float *)malloc(n * dimension * sizeof(float));
+
+    cudaStream_t streams[2];
+    for (int i = 0; i < 2; i++)
+    {
+        cudaStreamCreate(&streams[i]);
+    }
 
     auto start = std::chrono::high_resolution_clock::now();
-
-    for(int cur_iter = 1; cur_iter <= MAX_ITER; ++cur_iter)
+    for (int cur_iter = 1; cur_iter <= MAX_ITER; ++cur_iter)
     {
-        // Cluster assignment step
-        launch_kmeans_labeling(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, TPB, K, dimension);
+        //memcpy(h_samples_div, h_samples.data(), n * dimension * sizeof(float));
+        //cudaMemcpy(d_samples_div[0], h_samples_div, n * dimension * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemset(d_clusterSizes, 0, K * sizeof(int));
+        for (int i = 1; i >= 0; i--)
+        {
+            memcpy(h_samples_div, h_samples.data() + i * n * dimension, n * dimension * sizeof(float));
+            cudaMemcpyAsync(d_samples_div[i], h_samples_div, n * dimension * sizeof(float), cudaMemcpyHostToDevice, streams[i]);
+
+            launch_kmeans_labeling(d_samples_div[1 - i], d_clusterIndices, d_clusterCenters, d_clusterSizes, n, n * (1 - i), TPB, K, dimension, streams[1 - i]);
+            cudaDeviceSynchronize(); 
+        }
+
+        //cudaFree(d_samples_div[0]);
+        //cudaFree(d_samples_div[1]);
+        cudaMemcpy(d_samples, h_samples.data(), N * dimension * sizeof(float), cudaMemcpyHostToDevice);
+
+        launch_kmeans_update_center(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, 0, TPB, K, dimension, NULL);
         cudaDeviceSynchronize();
 
-        // Centroid update step
-        launch_kmeans_update_center(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, TPB, K, dimension);
-        cudaDeviceSynchronize();
-
-        cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_clusterCenters.data(), d_clusterCenters, K * dimension * sizeof(float), cudaMemcpyDeviceToHost);
-
-        double sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, dimension);
-        std::cout << "Iteration " << cur_iter << ": SSE = " << sse << std::endl;
+        //cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
+        //cudaMemcpy(h_clusterCenters.data(), d_clusterCenters, K * dimension * sizeof(float), cudaMemcpyDeviceToHost);
+        //double sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, dimension);
+        //std::cout << "Iteration " << cur_iter << ": SSE = " << sse << std::endl;
     }
-    cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
+    //cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> elapsed = end - start;
 
     std::cout << "K-means execution time: " << elapsed.count() << " ms" << std::endl;
+
+    for (int i = 0; i < 2; i++)
+    {
+        cudaStreamDestroy(streams[i]);
+        cudaFree(d_samples_div[i]);
+    }
 
 #if FileFlag
     std::ofstream File("kmeans_result.txt");

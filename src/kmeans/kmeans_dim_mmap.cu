@@ -170,10 +170,9 @@ void launch_kmeans_labeling(float *d_samples, int *d_clusterIndices, float *d_cl
 
 void launch_kmeans_update_center(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, int *d_clusterSizes, int N, int S, int TPB, int K, int DIM, cudaStream_t stream)
 {
-    cudaMemset(d_clusterCenters, 0, K * DIM * sizeof(float));
     int sharedMemSize = sizeof(float) * DIM;
 
-    kmeans_update_centers_kernel<<<N, TPB, sharedMemSize>>>(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, S, K, DIM);
+    kmeans_update_centers_kernel<<<N, TPB, sharedMemSize, stream>>>(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, S, K, DIM);
     //kmeans_update_centers_kernel<<<N, TPB>>>(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, K, DIM);
     //kmeans_average_centers_kernel<<<(K + TPB - 1) / TPB, TPB>>>(d_clusterCenters, d_clusterSizes, K, DIM);
 }

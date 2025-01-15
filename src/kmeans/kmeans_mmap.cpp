@@ -9,7 +9,8 @@
 #include <limits>
 #include "kmeans_mmap.h"
 
-#define FileFlag 0
+#define CHUNKSIZE 100000
+#define FileFlag 1
 
 template<typename VecType = float>
 void generate_sample_data(std::vector<VecType>& h_data, std::vector<VecType>& h_clusterCenters, std::size_t N, std::size_t K, std::size_t DIM, std::size_t seed = std::numeric_limits<std::size_t>::max()) {
@@ -65,14 +66,14 @@ int main(int argc, char *argv[])
     std::size_t K = std::atoi(argv[3]); // Number of clusters
     int MAX_ITER = std::atoi(argv[4]);
     std::size_t dimension = std::atoi(argv[5]); // Dimension of data points
-    std::size_t n = N / 2;
+    std::size_t maxn = CHUNKSIZE / 2;
+    int numOfChunk = (N + CHUNKSIZE - 1) / CHUNKSIZE;
     //std::size_t n = std::atoi(argv[6]);
 
     float *d_clusterCenters = nullptr;
     int *d_clusterIndices = nullptr, *d_clusterSizes = nullptr;
     float *d_samples = nullptr;
 
-    float *d_samples_div[2];
 
     std::vector<float> h_clusterCenters(K * dimension), h_samples(N * dimension);
     int *h_clusterIndices = (int*)malloc(N * sizeof(int));
@@ -90,43 +91,78 @@ int main(int argc, char *argv[])
     cudaMemcpy(d_clusterCenters, h_clusterCenters.data(), K * dimension * sizeof(float), cudaMemcpyHostToDevice);
     //cudaMemcpy(d_samples, h_samples.data(), N * dimension * sizeof(float), cudaMemcpyHostToDevice);
 
-    cudaMalloc(&d_samples_div[0], n * dimension * sizeof(float));
-    cudaMalloc(&d_samples_div[1], n * dimension * sizeof(float));
     cudaMalloc(&d_samples, N * dimension * sizeof(float));
-    float *h_samples_div = (float *)malloc(n * dimension * sizeof(float));
 
-    cudaStream_t streams[2];
-    for (int i = 0; i < 2; i++)
-    {
-        cudaStreamCreate(&streams[i]);
-    }
+
+    float *d_samples_div[2];
+    cudaMalloc(&d_samples_div[0], maxn * dimension * sizeof(float));
+    cudaMalloc(&d_samples_div[1], maxn * dimension * sizeof(float));
+    float *h_pinned[2];
+    cudaMallocHost(&h_pinned[0], maxn * dimension * sizeof(float));
+    cudaMallocHost(&h_pinned[1], maxn * dimension * sizeof(float));
+    //cudaMallocHost(&h_pinned[2], maxn * dimension * sizeof(float));
+    //cudaMallocHost(&h_pinned[3], maxn * dimension * sizeof(float));
+
 
     auto start = std::chrono::high_resolution_clock::now();
     for (int cur_iter = 1; cur_iter <= MAX_ITER; ++cur_iter)
     {
-        //memcpy(h_samples_div, h_samples.data(), n * dimension * sizeof(float));
-        //cudaMemcpy(d_samples_div[0], h_samples_div, n * dimension * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemset(d_clusterSizes, 0, K * sizeof(int));
-        for (int i = 1; i >= 0; i--)
+        cudaStream_t streams[2];
+        for (int i = 0; i < 2; i++)
         {
-            memcpy(h_samples_div, h_samples.data() + i * n * dimension, n * dimension * sizeof(float));
-            cudaMemcpyAsync(d_samples_div[i], h_samples_div, n * dimension * sizeof(float), cudaMemcpyHostToDevice, streams[i]);
-
-            launch_kmeans_labeling(d_samples_div[1 - i], d_clusterIndices, d_clusterCenters, d_clusterSizes, n, n * (1 - i), TPB, K, dimension, streams[1 - i]);
-            cudaDeviceSynchronize(); 
+            cudaStreamCreate(&streams[i]);
         }
 
-        //cudaFree(d_samples_div[0]);
-        //cudaFree(d_samples_div[1]);
-        cudaMemcpy(d_samples, h_samples.data(), N * dimension * sizeof(float), cudaMemcpyHostToDevice);
-
-        launch_kmeans_update_center(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, 0, TPB, K, dimension, NULL);
+        cudaMemset(d_clusterSizes, 0, K * sizeof(int));
+        for (int i = 0; i < numOfChunk; i++)
+        {
+            for (int j = 0; j < 2; j++)
+            {
+                int offset = i * CHUNKSIZE + j * maxn;
+                if (offset >= N)
+                    break;
+                //int bufferIdx = (i * 2 + j) % 4;
+                int n = std::min(maxn, N - offset);  
+                memcpy(h_pinned[j], h_samples.data() + offset * dimension, n * sizeof(float) * dimension);
+                cudaMemcpyAsync(d_samples_div[j], h_pinned[j], n * dimension * sizeof(float), cudaMemcpyHostToDevice, streams[j]);
+                launch_kmeans_labeling(d_samples_div[j], d_clusterIndices, d_clusterCenters, d_clusterSizes, n, offset, TPB, K, dimension, streams[j]);
+            }
+            cudaDeviceSynchronize();
+            
+        }
         cudaDeviceSynchronize();
 
-        //cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
-        //cudaMemcpy(h_clusterCenters.data(), d_clusterCenters, K * dimension * sizeof(float), cudaMemcpyDeviceToHost);
-        //double sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, dimension);
-        //std::cout << "Iteration " << cur_iter << ": SSE = " << sse << std::endl;
+        cudaMemset(d_clusterCenters, 0, K * dimension * sizeof(float));
+        for (int i = 0; i < numOfChunk; i++)
+        {
+            for (int j = 0; j < 2; j++)
+            {
+                int offset = i * CHUNKSIZE + j * maxn;
+                if (offset >= N)
+                    break;
+                
+                int n = std::min(maxn, N - offset);
+                memcpy(h_pinned[j], h_samples.data() + offset * dimension, n * sizeof(float) * dimension);
+                cudaMemcpyAsync(d_samples_div[j], h_pinned[j], n * dimension * sizeof(float), cudaMemcpyHostToDevice, streams[j]);
+                launch_kmeans_update_center(d_samples_div[j], d_clusterIndices, d_clusterCenters, d_clusterSizes, n, offset, TPB, K, dimension, streams[j]);
+            }
+            cudaDeviceSynchronize();
+            std::cout << 1 << std::endl;
+        }
+        // cudaMemcpy(d_samples, h_samples.data(), N * dimension * sizeof(float), cudaMemcpyHostToDevice);
+        // launch_kmeans_update_center(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, 0, TPB, K, dimension, NULL);
+        // cudaDeviceSynchronize();
+        
+
+        for (int i = 0; i < 2; i++)
+        {
+            cudaStreamDestroy(streams[i]);
+        }
+
+        cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_clusterCenters.data(), d_clusterCenters, K * dimension * sizeof(float), cudaMemcpyDeviceToHost);
+        double sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, dimension);
+        std::cout << "Iteration " << cur_iter << ": SSE = " << sse << std::endl;
     }
     //cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
     auto end = std::chrono::high_resolution_clock::now();
@@ -136,8 +172,8 @@ int main(int argc, char *argv[])
 
     for (int i = 0; i < 2; i++)
     {
-        cudaStreamDestroy(streams[i]);
         cudaFree(d_samples_div[i]);
+        cudaFreeHost(h_pinned[i]);
     }
 
 #if FileFlag
@@ -169,7 +205,6 @@ int main(int argc, char *argv[])
     cudaFree(d_clusterIndices);
     cudaFree(d_clusterCenters);
     cudaFree(d_clusterSizes);
-
     free(h_clusterIndices);
 
     return 0;

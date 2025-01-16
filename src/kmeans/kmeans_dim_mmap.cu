@@ -117,7 +117,7 @@ __global__ void kmeans_update_centers_kernel(float *d_samples, int *d_clusterInd
 
     for (int i = tid; i < DIM; i += blockDim.x)
     {
-        pointSum[i] = d_samples[pointNum * DIM + i]; 
+        pointSum[i] = d_samples[blockIdx.x * DIM + i]; 
     }
     __syncthreads();
 

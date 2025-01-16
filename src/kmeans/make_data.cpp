@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <iostream>
 #include <vector>
 #include <math.h>
 #include <random>
@@ -57,6 +58,7 @@ int main(int argc, char *argv[] )
     std::vector<float> h_clusterCenters(K * dimension), h_samples(n * dimension);
     int *h_clusterIndices = (int *)malloc(N * sizeof(int));
 
+    std::cout << 1 << std::endl;
     generate_centroids(h_clusterCenters, K, dimension);
 
     FILE *centFile = fopen("centroidFile", "wb");
@@ -88,6 +90,7 @@ int main(int argc, char *argv[] )
         n = std::min(n, N - offset);
         generate_sample_data(h_samples, h_clusterCenters, n, K, dimension);
 
+        std::cout << h_samples[0] << std::endl;
         size_t wBytes = fwrite(h_samples.data(), sizeof(float), n * dimension, sampleFile);
 
         if (wBytes != n * dimension)

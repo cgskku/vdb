@@ -6,9 +6,9 @@ CXX = g++
 INCLUDES = -I.
 CFLAG = -O3
 
-TARGETS = kmeans kmeans_dim kmeans_dim_chunk
+TARGETS = kmeans kmeans_dim kmeans_dim_chunk kmeans_test
 
-OBJS = kmeans.o kmeans_dim.o kmeans_dim_chunk.o
+OBJS = kmeans.o kmeans_dim.o kmeans_dim_chunk.o kmeans_test.o
 
 all: $(TARGETS)
 
@@ -21,6 +21,9 @@ kmeans_dim: kmeans_dim.o kmeans.cpp
 kmeans_dim_chunk: kmeans_dim_chunk.o kmeans_chunk.cpp
 	$(NVCC) $(INCLUDES) $^ -o $@
 
+kmeans_test: kmeans_test.o kmeans_test.cpp
+	$(NVCC) $(INCLUDES) $^ -o $@
+
 %.o: %.cu
 	$(NVCC) $(INCLUDES) -c $< -o $@
 
@@ -30,3 +33,4 @@ clean:
 kmeans.o: kmeans.cu kmeans.h
 kmeans_dim.o: kmeans_dim.cu kmeans.h
 kmeans_dim_chunk.o: kmeans_dim_chunk.cu kmeans.h
+kmeans_test.o: kmeans_test.cu kmeans_test.h

@@ -40,7 +40,7 @@ void generate_sample_data(std::vector<VecType>& h_data, std::vector<VecType>& h_
     return;
 }
 
-void load_csv_data(const std::string& filename, std::vector<float>& h_data, std::size_t& N, std::size_t DIM) {
+void load_csv_data(const std::string& filename, std::vector<float>& h_data, std::size_t& N, std::size_t& DIM) {
     std::ifstream file(filename);
     if (!file.is_open()) {
         std::cerr << "Error: Unable to open file " << filename << std::endl;
@@ -49,24 +49,38 @@ void load_csv_data(const std::string& filename, std::vector<float>& h_data, std:
 
     std::string line;
     std::vector<std::vector<float>> temp_data;
+    bool is_header = true;  // First Row -> Header
+
     while (std::getline(file, line)) {
+        if (is_header) {
+            is_header = false;
+            continue;  // Skip Header
+        }
+
         std::istringstream s(line);
         std::string value;
         std::vector<float> row;
         int col = 0;
+
         while (std::getline(s, value, ',')) {
-            if (col > 0) {
-                row.push_back(std::stof(value));
+            try {
+                if (col > 0) {  // Skip Header
+                    row.push_back(std::stof(value));
+                }
+                col++;
+            } catch (const std::invalid_argument& e) {
+                std::cerr << "Error: Invalid numeric value in file at column " << col << ": " << value << std::endl;
+                exit(EXIT_FAILURE);
             }
-            col++;
         }
+
         if (!row.empty()) {
             temp_data.push_back(row);
         }
     }
     file.close();
 
-    N = temp_data.size(); 
+    N = temp_data.size();
     DIM = temp_data[0].size();
     h_data.resize(N * DIM);
 

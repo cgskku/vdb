@@ -11,7 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#define CHUNKSIZE 100000
+#define CHUNKSIZE 1000000
 #define FileFlag 0
 
 template<typename VecType = float>
@@ -95,7 +95,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    ssize_t bytes_read = read(centFd, h_clusterCenters.data(), K * dimension * sizeof(float));
+    int bytes_read = read(centFd, h_clusterCenters.data(), K * dimension * sizeof(float));
     if (bytes_read < 0)
     {
         printf("read centroid file failed\n");
@@ -133,19 +133,23 @@ int main(int argc, char *argv[])
     auto start = std::chrono::high_resolution_clock::now();
     for (int cur_iter = 1; cur_iter <= MAX_ITER; ++cur_iter)
     {
+        std::cout << "iter: " << cur_iter << std::endl; 
         cudaStream_t streams[2];
         for (int i = 0; i < 2; i++)
         {
             cudaStreamCreate(&streams[i]);
         }
+        h_samples.resize(CHUNKSIZE * sizeof(float) * dimension);
+        h_samples.clear();
 
+        lseek(sampleFd, 0, SEEK_SET);
         cudaMemset(d_clusterSizes, 0, K * sizeof(int));
         for (int i = 0; i < numOfChunk; i++)
         {
             bytes_read = read(sampleFd, h_samples.data(), CHUNKSIZE * dimension * sizeof(float));
+            //std::cout << numOfChunk << std::endl;
             if (bytes_read < 0)
             {
-                std::cout << h_samples[0] << std::endl;
                 printf("read sample fild failed in %d\n", i);
                 return 1;
             }
@@ -166,10 +170,12 @@ int main(int argc, char *argv[])
             
         }
 
+        lseek(sampleFd, 0, SEEK_SET);
         cudaMemset(d_clusterCenters, 0, K * dimension * sizeof(float));
         for (int i = 0; i < numOfChunk; i++)
         {
             bytes_read = read(sampleFd, h_samples.data(), CHUNKSIZE * dimension * sizeof(float));
+            //std::cout << numOfChunk << std::endl;
             if (bytes_read < 0)
             {
                 printf("read sample fild failed\n");
@@ -200,13 +206,19 @@ int main(int argc, char *argv[])
             cudaStreamDestroy(streams[i]);
         }
 
-        close(sampleFd);
-        close(centFd);
-
-        //cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
-        //cudaMemcpy(h_clusterCenters.data(), d_clusterCenters, K * dimension * sizeof(float), cudaMemcpyDeviceToHost);
-        //double sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, dimension);
-        //std::cout << "Iteration " << cur_iter << ": SSE = " << sse << std::endl;
+        // lseek(sampleFd, 0, SEEK_SET);
+        // h_samples.resize(N * sizeof(float) * dimension);
+        // h_samples.clear();
+        // bytes_read = read(sampleFd, h_samples.data(), N * dimension * sizeof(float));
+        // if (bytes_read < 0)
+        // {
+        //     printf("read sample fild failed\n");
+        //     return 1;
+        // }
+        // cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
+        // cudaMemcpy(h_clusterCenters.data(), d_clusterCenters, K * dimension * sizeof(float), cudaMemcpyDeviceToHost);
+        // double sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, dimension);
+        // std::cout << "Iteration " << cur_iter << ": SSE = " << sse << std::endl;
     }
     //cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
     auto end = std::chrono::high_resolution_clock::now();
@@ -219,6 +231,8 @@ int main(int argc, char *argv[])
         cudaFree(d_samples_div[i]);
         cudaFreeHost(h_pinned[i]);
     }
+    close(sampleFd);
+    close(centFd);
 
 #if FileFlag
     std::ofstream File("kmeans_result.txt");

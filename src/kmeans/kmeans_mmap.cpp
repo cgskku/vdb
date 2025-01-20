@@ -10,8 +10,9 @@
 #include "kmeans_mmap.h"
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
-#define CHUNKSIZE 1000000
+#define CHUNKSIZE 100000
 #define FileFlag 0
 
 template<typename VecType = float>
@@ -102,6 +103,15 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    float *mappedSample = (float *)mmap(NULL, N * sizeof(float) * dimension, PROT_READ, MAP_PRIVATE, sampleFd, 0);
+    if (mappedSample == MAP_FAILED)
+    {
+        printf("Failed to map sample file\n");
+        close(sampleFd);
+        close(centFd);
+        return 1;
+    }
+
     int *h_clusterIndices = (int*)malloc(N * sizeof(int));
     // read file from sampleFile
     //generate_sample_data(h_samples, h_clusterCenters, N, K, dimension);
@@ -128,41 +138,27 @@ int main(int argc, char *argv[])
     cudaMallocHost(&h_pinned[1], maxn * dimension * sizeof(float));
     //cudaMallocHost(&h_pinned[2], maxn * dimension * sizeof(float));
     //cudaMallocHost(&h_pinned[3], maxn * dimension * sizeof(float));
-    h_samples.clear();
 
     auto start = std::chrono::high_resolution_clock::now();
     for (int cur_iter = 1; cur_iter <= MAX_ITER; ++cur_iter)
     {
-        std::cout << "iter: " << cur_iter << std::endl; 
         cudaStream_t streams[2];
         for (int i = 0; i < 2; i++)
         {
             cudaStreamCreate(&streams[i]);
         }
-        h_samples.resize(CHUNKSIZE * sizeof(float) * dimension);
-        h_samples.clear();
 
-        lseek(sampleFd, 0, SEEK_SET);
         cudaMemset(d_clusterSizes, 0, K * sizeof(int));
         for (int i = 0; i < numOfChunk; i++)
         {
-            bytes_read = read(sampleFd, h_samples.data(), CHUNKSIZE * dimension * sizeof(float));
-            //std::cout << numOfChunk << std::endl;
-            if (bytes_read < 0)
-            {
-                printf("read sample fild failed in %d\n", i);
-                return 1;
-            }
-
             for (int j = 0; j < 2; j++)
             {
                 int offset = i * CHUNKSIZE + j * maxn;
-                int memOffset = j * maxn;
                 if (offset >= N)
                     break;
                 //int bufferIdx = (i * 2 + j) % 4;
-                int n = std::min(maxn, N - offset);  
-                memcpy(h_pinned[j], h_samples.data() + memOffset * dimension, n * sizeof(float) * dimension);
+                int n = std::min(maxn, N - offset);
+                memcpy(h_pinned[j], &mappedSample[offset * dimension], n * sizeof(float) * dimension);
                 cudaMemcpyAsync(d_samples_div[j], h_pinned[j], n * dimension * sizeof(float), cudaMemcpyHostToDevice, streams[j]);
                 launch_kmeans_labeling(d_samples_div[j], d_clusterIndices, d_clusterCenters, d_clusterSizes, n, offset, TPB, K, dimension, streams[j]);
             }
@@ -170,27 +166,17 @@ int main(int argc, char *argv[])
             
         }
 
-        lseek(sampleFd, 0, SEEK_SET);
         cudaMemset(d_clusterCenters, 0, K * dimension * sizeof(float));
         for (int i = 0; i < numOfChunk; i++)
         {
-            bytes_read = read(sampleFd, h_samples.data(), CHUNKSIZE * dimension * sizeof(float));
-            //std::cout << numOfChunk << std::endl;
-            if (bytes_read < 0)
-            {
-                printf("read sample fild failed\n");
-                return 1;
-            }
-
             for (int j = 0; j < 2; j++)
             {
                 int offset = i * CHUNKSIZE + j * maxn;
-                int memOffset = j * maxn;
                 if (offset >= N)
                     break;
                 
                 int n = std::min(maxn, N - offset);
-                memcpy(h_pinned[j], h_samples.data() + memOffset * dimension, n * sizeof(float) * dimension);
+                memcpy(h_pinned[j], mappedSample + offset * dimension, n * sizeof(float) * dimension);
                 cudaMemcpyAsync(d_samples_div[j], h_pinned[j], n * dimension * sizeof(float), cudaMemcpyHostToDevice, streams[j]);
                 launch_kmeans_update_center(d_samples_div[j], d_clusterIndices, d_clusterCenters, d_clusterSizes, n, offset, TPB, K, dimension, streams[j]);
             }
@@ -231,8 +217,10 @@ int main(int argc, char *argv[])
         cudaFree(d_samples_div[i]);
         cudaFreeHost(h_pinned[i]);
     }
+    munmap(mappedSample, N * sizeof(float) * dimension);
     close(sampleFd);
     close(centFd);
+
 
 #if FileFlag
     std::ofstream File("kmeans_result.txt");

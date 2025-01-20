@@ -9,6 +9,7 @@
 #include "kmeans.h"
 #include <sstream>
 #include <string>
+#include <map>
 
 #define FileFlag 0
 
@@ -40,7 +41,7 @@ void generate_sample_data(std::vector<VecType>& h_data, std::vector<VecType>& h_
     return;
 }
 
-void load_csv_data(const std::string& filename, std::vector<float>& h_data, std::size_t& N, std::size_t& DIM) {
+void load_csv_data(const std::string& filename, std::vector<float>& h_data, std::vector<std::string>& h_species, std::size_t& N, std::size_t& DIM) {
     std::ifstream file(filename);
     if (!file.is_open()) {
         std::cerr << "Error: Unable to open file " << filename << std::endl;
@@ -62,9 +63,13 @@ void load_csv_data(const std::string& filename, std::vector<float>& h_data, std:
         std::vector<float> row;
         int col = 0;
 
+        std::string species_name;
+
         while (std::getline(s, value, ',')) {
             try {
-                if (col > 0) {  // Skip Header
+                if (col == 0) {
+                    species_name = value;  // first col: species
+                } else {
                     row.push_back(std::stof(value));
                 }
                 col++;
@@ -75,6 +80,7 @@ void load_csv_data(const std::string& filename, std::vector<float>& h_data, std:
         }
 
         if (!row.empty()) {
+            h_species.push_back(species_name);
             temp_data.push_back(row);
         }
     }
@@ -125,10 +131,11 @@ int main(int argc, char *argv[])
     int MAX_ITER = std::atoi(argv[4]);
 
     std::vector<float> h_samples;
+    std::vector<std::string> h_species;
     std::size_t N;
     std::size_t dimension;
 
-    load_csv_data(csv_file, h_samples, N, dimension);
+    load_csv_data(csv_file, h_samples, h_species, N, dimension);
 
     float *d_samples = nullptr, *d_clusterCenters = nullptr;
     int *d_clusterIndices = nullptr, *d_clusterSizes = nullptr;
@@ -197,6 +204,21 @@ int main(int argc, char *argv[])
     std::chrono::duration<double, std::milli> elapsed = end - start;
 
     std::cout << "K-means execution time: " << elapsed.count() << " ms" << std::endl;
+
+    std::cout << "\nCluster Results:\n";
+    std::map<int, std::map<std::string, int>> cluster_species_count;
+
+    for (std::size_t i = 0; i < N; ++i) {
+        int cluster_id = h_clusterIndices[i];
+        cluster_species_count[cluster_id][h_species[i]]++;
+    }
+
+    for (const auto& cluster : cluster_species_count) {
+        std::cout << "Cluster " << cluster.first << ":\n";
+        for (const auto& species_count : cluster.second) {
+            std::cout << "   " << species_count.first << ": " << species_count.second << " samples\n";
+        }
+    }
 
 #if FileFlag
     std::ofstream File("kmeans_result.txt");

@@ -79,15 +79,13 @@ void load_csv_data(const std::string& filename, std::vector<float>& h_data, std:
 
 void file_write_sample(std::vector<float>& h_data, int N, int dimension, std::string filename)
 {
-    std::ofstream File(filename);
-    File << "\n======Data Points======\n";
+    std::ofstream File("txt/" + filename);
+    // File << "\n======Data Points======\n";
     for (std::size_t i = 0; i < N; ++i) {
         // File << "Data Point " << i << ": " << std::endl;
-        File << "[";
         for (std::size_t d = 0; d < dimension; ++d) {
             File << h_data[i * dimension + d] << ", ";
         }
-        File << "],";
         File << "\n";
     }
     File.close();
@@ -168,6 +166,7 @@ void pca_cuSOLVER(
     cudaMemcpy(h_eigenVec.data(), d_Csub, Dim * reducedDim * sizeof(float), cudaMemcpyDeviceToHost);
 
     // test
+
     std::vector<float> h_eigenVal(Dim);
     cudaMemcpy(h_eigenVal.data(), d_eigenVal, Dim * sizeof(float), cudaMemcpyDeviceToHost);
 
@@ -350,25 +349,34 @@ int main(int argc, char *argv[])
     cudaMemset(d_clusterIndices, -1, N * sizeof(int));
     cudaMemset(d_clusterSizes, 0, K * sizeof(int));
 
-    std::default_random_engine generator;
-    std::uniform_int_distribution<int> distribution(0, N - 1);
-    for (std::size_t k = 0; k < K; ++k) {
-        for (std::size_t d = 0; d < dimension; ++d) {
-            h_clusterCenters[k * dimension + d] = h_samples[distribution(generator) * dimension + d];
-        }
-    }
+    // std::default_random_engine generator;
+    // std::uniform_int_distribution<int> distribution(0, N - 1);
+    // for (std::size_t k = 0; k < K; ++k) {
+    //     for (std::size_t d = 0; d < dimension; ++d) {
+    //         h_clusterCenters[k * dimension + d] = h_samples[distribution(generator) * dimension + d];
+    //     }
+    // }
 
     PCA(h_samples, h_reducedSamples, h_eigenVec, h_meanVec, N, dimension, reducedDim);
     std::cout << "PCA done" << std::endl;
 
+    std::default_random_engine generator;
+    std::uniform_int_distribution<int> distribution(0, N - 1);
+    for (std::size_t k = 0; k < K; ++k) {
+        for (std::size_t d = 0; d < reducedDim; ++d) {
+            h_reducedClusterCenters[k * reducedDim + d] = h_reducedSamples[distribution(generator) * reducedDim + d];
+        }
+    }
+
     cudaMemcpy(d_samples, h_samples.data(), N * dimension * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_clusterCenters, h_clusterCenters.data(), K * dimension * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_reducedSamples, h_reducedSamples.data(), N * reducedDim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_reducedClusterCenters, h_reducedClusterCenters.data(), K * reducedDim * sizeof(float), cudaMemcpyHostToDevice);
 
     for(int cur_iter = 1; cur_iter <= MAX_ITER; ++cur_iter)
     {
-        transform_PCA(h_clusterCenters, h_reducedClusterCenters, h_eigenVec, h_meanVec, K, dimension, reducedDim);
-        cudaMemcpy(d_reducedClusterCenters, h_reducedClusterCenters.data(), K * reducedDim * sizeof(float), cudaMemcpyHostToDevice);
+        // PCA(h_clusterCenters, h_reducedClusterCenters, h_eigenVec, h_meanVec, K, dimension, reducedDim);
+        // transform_PCA(h_clusterCenters, h_reducedClusterCenters, h_eigenVec, h_meanVec, K, dimension, reducedDim);
 
         // Cluster assignment step
         // launch_kmeans_labeling(d_samples, d_clusterIndices, d_clusterCenters, N, TPB, K, dimension);
@@ -376,19 +384,21 @@ int main(int argc, char *argv[])
         cudaDeviceSynchronize();
 
         // Centroid update step
-        launch_kmeans_update_center(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, TPB, K, dimension);
+        launch_kmeans_update_center(d_reducedSamples, d_clusterIndices, d_reducedClusterCenters, d_clusterSizes, N, TPB, K, reducedDim);
         cudaDeviceSynchronize();
 
         cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_clusterCenters.data(), d_clusterCenters, K * dimension * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_reducedClusterCenters.data(), d_reducedClusterCenters, K * reducedDim * sizeof(float), cudaMemcpyDeviceToHost);
     
-        double sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, dimension);
+        double sse = compute_SSE(h_reducedSamples, h_reducedClusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, reducedDim);
         std::cout << "Iteration " << cur_iter << ": SSE = " << sse << std::endl;
     }
     
 #if FileFlag
     file_write_sample(h_clusterCenters, K, dimension, "centroid.txt");
     file_write_sample(h_reducedClusterCenters, K, reducedDim, "centroid_reduced.txt");
+    file_write_sample(h_samples, N, dimension, "samples.txt");
+    file_write_sample(h_reducedSamples, N, reducedDim, "samples_reduced.txt");
 #endif
 
     std::cout << "\nCluster Results:\n";

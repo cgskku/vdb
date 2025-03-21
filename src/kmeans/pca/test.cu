@@ -94,15 +94,12 @@ __global__ void extract_top_eigenvectors(float* d_Cov, float* d_Vsub, int Dim, i
     }
 }
 
-__global__ void addMean(float* d_out, const float* d_meanVec,
-                        int N, int Dim)
-{
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = N * Dim;
-  if(idx < total){
-    int d = idx % Dim;
-    d_out[idx] += d_meanVec[d];
-  }
+__global__ void denormalize_kernel(float* d_data, const float* d_mean, const float* d_std, int N, int Dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N * Dim) {
+         int j = idx % Dim;
+         d_data[idx] = d_data[idx] * d_std[j] + d_mean[j];
+    }
 }
 
 void launch_extract_top_eigenvectors(
@@ -113,11 +110,7 @@ void launch_extract_top_eigenvectors(
     extract_top_eigenvectors<<<blocks, TPB>>>(d_Cov, d_Vsub, Dim, reducedDim);
 }
 
-void launch_addMean(
-    float* d_out, const float* d_meanVec,
-    int N, int Dim, int TPB)
-{
-  int total = N * Dim;
-  int blocks = (total + TPB - 1) / TPB;
-  addMean<<<blocks, TPB>>>(d_out, d_meanVec, N, Dim);
+void launch_denormalize(float* d_data, const float* d_mean, const float* d_std, int N, int Dim, int TPB) {
+    int blocks = (N * Dim + TPB - 1) / TPB;
+    denormalize_kernel<<<blocks, TPB>>>(d_data, d_mean, d_std, N, Dim);
 }

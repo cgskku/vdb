@@ -91,6 +91,21 @@ void file_write_sample(std::vector<float>& h_data, int N, int dimension, std::st
     File.close();
 }
 
+void file_write_sample(std::vector<float>& h_data, int* h_clusterIndices ,int N, int dimension, std::string filename)
+{
+    std::ofstream File("txt/" + filename);
+    // File << "\n======Data Points======\n";
+    for (std::size_t i = 0; i < N; ++i) {
+        // File << "Data Point " << i << ": " << std::endl;
+        for (std::size_t d = 0; d < dimension; ++d) {
+            File << h_data[i * dimension + d] << ", ";
+        }
+        File << h_clusterIndices[i];
+        File << "\n";
+    }
+    File.close();
+}
+
 double compute_SSE(const std::vector<float>& data, const std::vector<float>& centroids,
                   const std::vector<int>& clusterIndices, std::size_t N, std::size_t K, std::size_t DIM) {
     double sse = 0.0;
@@ -114,80 +129,123 @@ void pca_cuSOLVER(
     cusolverDnHandle_t cusolverHandle
     )
 {
-    float* d_X;
-    float* d_outX;
-
+    // column major로 바꾸기
+    std::vector<float> h_data_col(N * Dim);
+    for(int i = 0; i < N; i++){
+        for(int j = 0; j < Dim; j++){
+            h_data_col[j * N + i] = h_data[i * Dim + j];
+        }
+    }
+    float* d_X = nullptr;
     cudaMalloc(&d_X, N * Dim * sizeof(float));
-    cudaMemcpy(d_X, h_data.data(), N * Dim * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMalloc(&d_outX, N * reducedDim * sizeof(float));
-    cudaMemset(d_outX, 0, N * reducedDim * sizeof(float));
+    cudaMemcpy(d_X, h_data_col.data(), N * Dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    size_t sizeCov = Dim * Dim;
-    float* d_Cov   = nullptr; // C = X^T * X
-    cudaMalloc(&d_Cov, sizeCov * sizeof(float));
-    cudaMemset(d_Cov, 0, sizeCov*sizeof(float));
+    float* d_X_svd = nullptr;
+    cudaMalloc(&d_X_svd, N * Dim * sizeof(float));
+    cudaMemcpy(d_X_svd, d_X, N * Dim * sizeof(float), cudaMemcpyDeviceToDevice);
 
-    float alpha = 1.0f, beta = 0.0f;
-    cublasSgemm(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, Dim, Dim, N, &alpha, d_X, N, d_X, N, &beta, d_Cov, Dim);
+    // singular value
+    std::vector<float> h_S(Dim);
+    float* d_S = nullptr;
+    cudaMalloc(&d_S, Dim * sizeof(float));
 
-    float scale = 1.0f / (N - 1);
-    cublasSscal(cublasHandle, Dim * Dim, &scale, d_Cov, 1); 
+    float* d_U = nullptr;
+    float* d_VT = nullptr;
+    cudaMalloc(&d_VT, Dim * Dim * sizeof(float));
 
-    float* d_eigenVal = nullptr;
-    cudaMalloc(&d_eigenVal, Dim * sizeof(float));
-    
     int workspace = 0;
     int info = 0;
-    cusolverDnSsyevd_bufferSize(cusolverHandle, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, Dim, d_Cov, Dim, d_eigenVal, &workspace);
+    cusolverDnSgesvd_bufferSize(cusolverHandle, N, Dim, &workspace);
 
     float* d_workspace = nullptr;
     int* d_info = nullptr;
-    cudaMalloc(&d_workspace, workspace * sizeof(float));
     cudaMalloc(&d_info, sizeof(int));
+    cudaMalloc(&d_workspace, workspace * sizeof(float));
 
-    cusolverDnSsyevd(cusolverHandle, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, Dim, d_Cov, Dim, d_eigenVal, d_workspace, workspace, d_info);
+    cusolverDnSgesvd(cusolverHandle, 'N', 'S',
+                        N, Dim,
+                        d_X_svd, N,
+                        d_S, 
+                        d_U, N,  
+                        d_VT, Dim, 
+                        d_workspace, workspace, nullptr, d_info);
+
     cudaMemcpy(&info, d_info, sizeof(int), cudaMemcpyDeviceToHost);
     if(info != 0){
-        std::cerr << "cusolverDnSsyevd -> info = " << info << std::endl;
+        std::cerr << "cusolverDnSgesvd -> info = " << info << std::endl;
+        cudaFree(d_X);
+        cudaFree(d_X_svd);
+        cudaFree(d_S);
+        cudaFree(d_VT);
+        cudaFree(d_workspace);
+        cudaFree(d_info);
+        return;
     }
 
-    float* d_Csub = nullptr;
-    cudaMalloc(&d_Csub, Dim * reducedDim * sizeof(float));
-    
-    int TPB = 128;
-    launch_extract_top_eigenvectors(d_Cov, d_Csub, Dim, reducedDim, TPB);
-    cudaDeviceSynchronize();
-
-    float alpha2 = 1.0f, beta2 = 0.0f;
-    cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, N, reducedDim, Dim, &alpha2, d_X, N, d_Csub, Dim, &beta2, d_outX, N);
-    cudaMemcpy(h_reducedData.data(), d_outX, N * reducedDim * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_S.data(), d_S, Dim * sizeof(float), cudaMemcpyDeviceToHost);
+    std::vector<float> h_VT(Dim * Dim);
+    cudaMemcpy(h_VT.data(), d_VT, Dim * Dim * sizeof(float), cudaMemcpyDeviceToHost);
 
     h_eigenVec.resize(Dim * reducedDim);
-    cudaMemcpy(h_eigenVec.data(), d_Csub, Dim * reducedDim * sizeof(float), cudaMemcpyDeviceToHost);
+    for(int i = 0; i < reducedDim; i++){
+        for(int j = 0; j < Dim; j++){
+            h_eigenVec[j + i * Dim] = h_VT[i + j * Dim];
+        }
+    }
 
-    // test
+    std::cout << "Singular values: ";
+    for(int i = 0; i < Dim; i++){
+        std::cout << h_S[i] << " ";
+    }
+    std::cout << std::endl;
 
-    std::vector<float> h_eigenVal(Dim);
-    cudaMemcpy(h_eigenVal.data(), d_eigenVal, Dim * sizeof(float), cudaMemcpyDeviceToHost);
+    float* d_V_reduced = nullptr;
+    cudaMalloc(&d_V_reduced, Dim * reducedDim * sizeof(float));
+    cudaMemcpy(d_V_reduced, h_eigenVec.data(), Dim * reducedDim * sizeof(float), cudaMemcpyHostToDevice);
+
+    float* d_outX = nullptr;
+    cudaMalloc(&d_outX, N * reducedDim * sizeof(float));
+
+    float alpha = 1.0f, beta = 0.0f;
+    cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+                N, reducedDim, Dim,
+                &alpha, d_X, N, d_V_reduced, Dim,
+                &beta, d_outX, N);
+    std::vector<float> h_reducedData_col(N * reducedDim);
+    cudaMemcpy(h_reducedData_col.data(), d_outX, N * reducedDim * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    // 다시 column major를 row major로 바꾸기
+    h_reducedData.resize(N * reducedDim);
+    for(int i = 0; i < N; i++){
+        for(int j = 0; j < reducedDim; j++){
+            h_reducedData[i * reducedDim + j] = h_reducedData_col[j * N + i];
+        }
+    }
 
     float total_variance = 0.0f;
-    for(auto val : h_eigenVal) total_variance += val;
-
-    std::vector<float> sorted_eigVals = h_eigenVal;
-    std::sort(sorted_eigVals.begin(), sorted_eigVals.end(), std::greater<float>());
+    std::vector<float> eigenvalues(Dim);
+    for(int i = 0; i < Dim; i++){
+        eigenvalues[i] = (h_S[i] * h_S[i]) / (N - 1);
+        total_variance += eigenvalues[i];
+    }
+    std::cout << "Eigenvalues: ";
+    for(int i = 0; i < Dim; i++){
+        std::cout << eigenvalues[i] << " ";
+    }
+    std::cout << "\nExplained variance ratio (first " << reducedDim << " components): ";
     float top_variance = 0.0f;
-    for(int i = 0; i < reducedDim; i++) top_variance += sorted_eigVals[i];
+    for (int i = 0; i < reducedDim; i++) {
+        top_variance += eigenvalues[i];
+    }
+    std::cout << (top_variance / total_variance) * 100 << "%" << std::endl;
 
-    std::cout << "Total Variance: " << total_variance << std::endl;
-    std::cout << "Top " << reducedDim << " Variance: " << top_variance << std::endl;
-    std::cout << "Explained Variance Ratio: " << (top_variance / total_variance) * 100 << "%" << std::endl;
-
-    cudaFree(d_Cov);
-    cudaFree(d_eigenVal);
+    cudaFree(d_X);
+    cudaFree(d_X_svd);
+    cudaFree(d_S);
+    cudaFree(d_VT);
     cudaFree(d_workspace);
     cudaFree(d_info);
-    cudaFree(d_Csub);
-    cudaFree(d_X);
+    cudaFree(d_V_reduced);
     cudaFree(d_outX);
 }
 
@@ -196,6 +254,7 @@ void PCA(
     std::vector<float>& h_reducedData,
     std::vector<float>& h_eigenVec,
     std::vector<float>& h_meanVec,
+    std::vector<float>& h_stdVec,
     int N, int Dim, int reducedDim)
 {
     h_meanVec.resize(Dim, 0.0f);
@@ -209,9 +268,20 @@ void PCA(
     for(int d = 0; d < Dim; d++){
         h_meanVec[d] /= (float)N;
     }
+
+    h_stdVec.resize(Dim, 0.0f);
+    for(int d = 0; d < Dim; d++){
+        float sum = 0.0f;
+        for (int i = 0; i < N; i++){
+            float diff = h_data[i * Dim + d] - h_meanVec[d];
+            sum += diff * diff;
+        }
+        h_stdVec[d] = sqrt(sum / (N - 1));
+    }
+
     for(int i = 0; i < N; i++){
-        for(int d = 0; d < Dim; d++){
-            tmp_h_data[i * Dim + d] = h_data[i * Dim + d] - h_meanVec[d];
+        for (int d = 0; d < Dim; d++){
+            tmp_h_data[i * Dim + d] = (h_data[i * Dim + d] - h_meanVec[d]) / h_stdVec[d];
         }
     }
 
@@ -227,83 +297,6 @@ void PCA(
     cusolverDnDestroy(cusolverHandle);
 }
 
-void transform_PCA(
-    std::vector<float>& h_data,
-    std::vector<float>& h_reducedData,
-    std::vector<float>& h_eigenVec,
-    std::vector<float>& h_meanVec,
-    int N, int Dim, int reducedDim
-)
-{
-    std::vector<float> tmp_h_data(N * Dim);
-    for(int i = 0; i < N; i++){
-        for(int d = 0; d<Dim; d++){
-            tmp_h_data[i * Dim + d] = h_data[i * Dim + d] - h_meanVec[d];
-        }
-    }
-
-    float *d_in =nullptr, *d_out = nullptr, *d_eigenVec = nullptr;
-    cudaMalloc(&d_in,  N * Dim * sizeof(float));
-    cudaMalloc(&d_out, N * reducedDim * sizeof(float));
-    cudaMalloc(&d_eigenVec, Dim * reducedDim * sizeof(float));
-
-    cudaMemcpy(d_in,  tmp_h_data.data(), N * Dim * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_eigenVec, h_eigenVec.data(), Dim * reducedDim * sizeof(float), cudaMemcpyHostToDevice);
-
-    cublasHandle_t handle;
-    cublasCreate(&handle);
-
-    const float alpha  = 1.0f, beta = 0.0f;
-    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, reducedDim, Dim, &alpha, d_in, N, d_eigenVec, Dim, &beta, d_out, N);
-
-    cublasDestroy(handle);
-
-    h_reducedData.resize(N * reducedDim);
-    cudaMemcpy(h_reducedData.data(), d_out, N * reducedDim * sizeof(float), cudaMemcpyDeviceToHost);
-
-    cudaFree(d_in);
-    cudaFree(d_out);
-    cudaFree(d_eigenVec);
-}
-void inverse_PCA(
-    std::vector<float>& h_data,
-    std::vector<float>& h_reducedData,
-    std::vector<float>& h_eigenVec,
-    std::vector<float>& h_meanVec,
-    int N, int Dim, int reducedDim
-)
-{
-    float *d_in =nullptr, *d_out = nullptr, *d_eigenVec = nullptr;
-    cudaMalloc(&d_in,  N * reducedDim * sizeof(float));
-    cudaMalloc(&d_out, N * Dim * sizeof(float));
-    cudaMalloc(&d_eigenVec, Dim * reducedDim * sizeof(float));
-
-    cudaMemcpy(d_in,  h_reducedData.data(), N * reducedDim * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_eigenVec, h_eigenVec.data(), Dim * reducedDim * sizeof(float), cudaMemcpyHostToDevice);
-
-    cublasHandle_t handle;
-    cublasCreate(&handle);
-
-    const float alpha  = 1.0f, beta = 0.0f;
-    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, Dim, reducedDim, &alpha, d_in, N, d_eigenVec, Dim, &beta, d_out, N);
-
-    cublasDestroy(handle);
-
-    float* d_meanVec = nullptr;
-    cudaMalloc(&d_meanVec, Dim * sizeof(float));
-    cudaMemcpy(d_meanVec, h_meanVec.data(), Dim * sizeof(float), cudaMemcpyHostToDevice);
-    int TPB = 128;
-    launch_addMean(d_out, d_meanVec, N, Dim, TPB);
-
-    h_data.resize(N * Dim);
-    cudaMemcpy(h_data.data(), d_out, N * Dim * sizeof(float), cudaMemcpyDeviceToHost);
-
-    cudaFree(d_in);
-    cudaFree(d_out);
-    cudaFree(d_eigenVec);
-    cudaFree(d_meanVec);
-}
-
 int main(int argc, char *argv[])
 {
     std::cout.precision(10);
@@ -311,6 +304,11 @@ int main(int argc, char *argv[])
     std::string csv_file = argv[1];
     std::size_t K = std::atoi(argv[2]); // Number of clusters
     int MAX_ITER = std::atoi(argv[3]);
+
+    if(argc < 4){
+        std::cerr << "Usage: " << argv[0] << " <csv_file> <K> <MAX_ITER>" << std::endl;
+        exit(EXIT_FAILURE);
+    }
 
     float *d_samples = nullptr, *d_clusterCenters = nullptr;
     float *d_reducedSamples = nullptr, *d_reducedClusterCenters = nullptr;
@@ -336,7 +334,7 @@ int main(int argc, char *argv[])
     std::vector<float> h_reducedSamples(N * reducedDim);
     std::vector<float> h_clusterCenters(K * dimension);
     std::vector<float> h_reducedClusterCenters(K * reducedDim);
-    std::vector<float> h_eigenVec, h_meanVec;
+    std::vector<float> h_eigenVec, h_meanVec, h_stdVec;
     int *h_clusterIndices = (int*)malloc(N * sizeof(int));
 
     cudaMalloc(&d_samples, N * dimension * sizeof(float));
@@ -349,15 +347,8 @@ int main(int argc, char *argv[])
     cudaMemset(d_clusterIndices, -1, N * sizeof(int));
     cudaMemset(d_clusterSizes, 0, K * sizeof(int));
 
-    // std::default_random_engine generator;
-    // std::uniform_int_distribution<int> distribution(0, N - 1);
-    // for (std::size_t k = 0; k < K; ++k) {
-    //     for (std::size_t d = 0; d < dimension; ++d) {
-    //         h_clusterCenters[k * dimension + d] = h_samples[distribution(generator) * dimension + d];
-    //     }
-    // }
-
-    PCA(h_samples, h_reducedSamples, h_eigenVec, h_meanVec, N, dimension, reducedDim);
+    std::cout << "Starting PCA " << dimension << ", " << reducedDim << std::endl;
+    PCA(h_samples, h_reducedSamples, h_eigenVec, h_meanVec, h_stdVec, N, dimension, reducedDim);
     std::cout << "PCA done" << std::endl;
 
     std::default_random_engine generator;
@@ -375,11 +366,6 @@ int main(int argc, char *argv[])
 
     for(int cur_iter = 1; cur_iter <= MAX_ITER; ++cur_iter)
     {
-        // PCA(h_clusterCenters, h_reducedClusterCenters, h_eigenVec, h_meanVec, K, dimension, reducedDim);
-        // transform_PCA(h_clusterCenters, h_reducedClusterCenters, h_eigenVec, h_meanVec, K, dimension, reducedDim);
-
-        // Cluster assignment step
-        // launch_kmeans_labeling(d_samples, d_clusterIndices, d_clusterCenters, N, TPB, K, dimension);
         launch_kmeans_labeling(d_reducedSamples, d_clusterIndices, d_reducedClusterCenters, N, TPB, K, reducedDim);
         cudaDeviceSynchronize();
 
@@ -397,8 +383,8 @@ int main(int argc, char *argv[])
 #if FileFlag
     file_write_sample(h_clusterCenters, K, dimension, "centroid.txt");
     file_write_sample(h_reducedClusterCenters, K, reducedDim, "centroid_reduced.txt");
-    file_write_sample(h_samples, N, dimension, "samples.txt");
-    file_write_sample(h_reducedSamples, N, reducedDim, "samples_reduced.txt");
+    file_write_sample(h_samples, h_clusterIndices, N, dimension, "samples_1.txt");
+    file_write_sample(h_reducedSamples, h_clusterIndices, N, reducedDim, "samples_reduced_1.txt");
 #endif
 
     std::cout << "\nCluster Results:\n";

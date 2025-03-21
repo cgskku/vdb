@@ -140,11 +140,27 @@ void launch_kmeans_update_center_chunk(
     kmeans_average_centers_kernel<<<(K + TPB - 1) / TPB, TPB>>>(d_clusterCenters, d_clusterSizes, K, DIM);
 }
 
-__global__ void extract_top_eigenvectors(float* d_Cov, float* d_Vsub, int Dim, int reducedDim){
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+__global__ void extract_top_eigenvectors(float* d_Cov, float* d_Vsub, int Dim, int reducedDim)
+{
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if(row < Dim){
         for(int rd = 0; rd < reducedDim; ++rd){
-            d_Vsub[rd * Dim + row] = d_Cov[(Dim - 1 - rd) * Dim + row];
+            int src_col = Dim - 1 - rd;
+            d_Vsub[rd * Dim + row] = d_Cov[src_col * Dim + row];
         }
     }
 }

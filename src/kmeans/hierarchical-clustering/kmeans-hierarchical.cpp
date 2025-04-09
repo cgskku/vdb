@@ -7,6 +7,7 @@
 #include <random>
 #include <limits>
 #include "kmeans.h"
+#include <omp.h>
 
 #define FileFlag 0
 
@@ -153,11 +154,11 @@ int main(int argc, char *argv[])
     }
     else {
         // === Hierarchical clustering ===
-        // arg: N, TPB, k_coarse, k_fine, MAX_ITER, DIM
-        int k_coarse = std::atoi(argv[3]); // number of coarse cluster
-        int k_fine = std::atoi(argv[4]);   // number of fine cluster
+        // N, TPB, k_coarse, k_fine, MAX_ITER, DIM
+        int k_coarse = std::atoi(argv[3]);
+        int k_fine = std::atoi(argv[4]);   
 
-        // Coarse clustering
+        // --- Coarse clustering ---
         float *d_samples = nullptr, *d_coarseCentroids = nullptr;
         int *d_coarseIndices = nullptr, *d_coarseSizes = nullptr;
         cudaMalloc(&d_samples, N * DIM * sizeof(float));
@@ -167,8 +168,8 @@ int main(int argc, char *argv[])
         cudaMemset(d_coarseIndices, -1, N * sizeof(int));
         cudaMemset(d_coarseSizes, 0, k_coarse * sizeof(int));
 
-        
         std::vector<float> h_coarseCenters(k_coarse * DIM), h_samples;
+
         generate_sample_data(h_samples, h_coarseCenters, N, k_coarse*k_fine, DIM);
         cudaMemcpy(d_coarseCentroids, h_coarseCenters.data(), k_coarse * DIM * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_samples, h_samples.data(), N * DIM * sizeof(float), cudaMemcpyHostToDevice);
@@ -176,6 +177,7 @@ int main(int argc, char *argv[])
         auto coarse_start = std::chrono::high_resolution_clock::now();
         std::vector<int> h_coarseIndices(N);
         std::vector<float> h_coarseCenters_out(k_coarse * DIM);
+
         for (int cur_iter = 1; cur_iter <= MAX_ITER/2; ++cur_iter) {
             launch_kmeans_labeling(d_samples, d_coarseIndices, d_coarseCentroids, N, TPB, k_coarse, DIM);
             cudaDeviceSynchronize();
@@ -191,13 +193,13 @@ int main(int argc, char *argv[])
         std::chrono::duration<double, std::milli> coarse_elapsed = coarse_end - coarse_start;
         std::cout << "Coarse clustering execution time: " << coarse_elapsed.count() << " ms" << std::endl;
 
-
         std::vector<float> h_allSamples = h_samples;
         std::vector<int> h_fineIndices(N, -1);
         std::vector< std::vector<float> > final_fine_centers(k_coarse, std::vector<float>(k_fine * DIM, 0));
 
         auto fine_total_start = std::chrono::high_resolution_clock::now();
 
+        #pragma omp parallel for schedule(dynamic)
         for (int c = 0; c < k_coarse; c++) {
             std::vector<int> indices;
             for (int i = 0; i < N; i++) {
@@ -234,27 +236,20 @@ int main(int argc, char *argv[])
             cudaMemset(d_subIndices, -1, sub_N * sizeof(int));
             cudaMemset(d_subSizes, 0, k_fine * sizeof(int));
 
-            auto fine_start = std::chrono::high_resolution_clock::now();
-            std::vector<int> h_subIndices(sub_N);
-            std::vector<float> h_subCentroids_out(k_fine * DIM);
             for (int cur_iter = 1; cur_iter <= MAX_ITER/2; ++cur_iter) {
                 launch_kmeans_labeling(d_subData, d_subIndices, d_subCentroids, sub_N, TPB, k_fine, DIM);
                 cudaDeviceSynchronize();
                 launch_kmeans_update_center(d_subData, d_subIndices, d_subCentroids, d_subSizes, sub_N, TPB, k_fine, DIM);
                 cudaDeviceSynchronize();
-
-                cudaMemcpy(h_subIndices.data(), d_subIndices, sub_N * sizeof(int), cudaMemcpyDeviceToHost);
-                cudaMemcpy(h_subCentroids_out.data(), d_subCentroids, k_fine * DIM * sizeof(float), cudaMemcpyDeviceToHost);
-                double fine_sse = compute_SSE(h_subData, h_subCentroids_out, h_subIndices, sub_N, k_fine, DIM);
-                std::cout << "Coarse Cluster " << c << " - Fine Iteration " << cur_iter << ": SSE = " << fine_sse << std::endl;
             }
-            auto fine_end = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double, std::milli> fine_elapsed = fine_end - fine_start;
-            std::cout << "Coarse Cluster " << c << " - Fine clustering execution time: " << fine_elapsed.count() << " ms" << std::endl;
 
-            final_fine_centers[c] = h_subCentroids_out; 
-
+            std::vector<int> h_subIndices(sub_N);
+            std::vector<float> h_subCentroids_out(k_fine * DIM);
             cudaMemcpy(h_subIndices.data(), d_subIndices, sub_N * sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_subCentroids_out.data(), d_subCentroids, k_fine * DIM * sizeof(float), cudaMemcpyDeviceToHost);
+
+            final_fine_centers[c] = h_subCentroids_out;
+
             for (int i = 0; i < sub_N; i++) {
                 int global_idx = indices[i];
                 h_fineIndices[global_idx] = h_subIndices[i];
@@ -264,16 +259,15 @@ int main(int argc, char *argv[])
             cudaFree(d_subCentroids);
             cudaFree(d_subIndices);
             cudaFree(d_subSizes);
-        }
+        } // end of parallel for
         auto fine_total_end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> fine_total_elapsed = fine_total_end - fine_total_start;
         std::cout << "Total Fine clustering execution time: " << fine_total_elapsed.count() << " ms" << std::endl;
 
-
         double hierarchical_global_sse = 0.0;
         for (int i = 0; i < N; i++) {
             int c = h_coarseIndices[i]; 
-            int f = h_fineIndices[i];    
+            int f = h_fineIndices[i];     
             if (c < 0 || f < 0) continue; 
 
             double sqDist = 0.0;

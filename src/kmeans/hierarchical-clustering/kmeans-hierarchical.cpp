@@ -108,7 +108,8 @@ int main(int argc, char *argv[])
         cudaMemcpy(d_samples, h_samples.data(), N * DIM * sizeof(float), cudaMemcpyHostToDevice);
 
         auto start = std::chrono::high_resolution_clock::now();
-        const double tol = 1e-5;
+        const double tol = 1e-4;
+        int stable_count = 0;
         std::vector<float> prev_centers(K * DIM, 0.0f);
 
         for (int cur_iter = 1; cur_iter <= MAX_ITER; ++cur_iter) {
@@ -127,8 +128,14 @@ int main(int argc, char *argv[])
                 }
                 std::cout << "Iteration " << cur_iter << ": center diff = " << diff << std::endl;
                 if (diff < tol) {
-                    std::cout << "Convergence reached at iteration " << cur_iter << std::endl;
-                    break;
+                    stable_count++;
+                    if (stable_count >= 3) {
+                        std::cout << "Convergence reached at iteration " << cur_iter << std::endl;
+                        break;
+                    }
+                }
+                else {
+                    stable_count = 0;
                 }
             }
             prev_centers = h_clusterCenters;
@@ -190,7 +197,8 @@ int main(int argc, char *argv[])
         cudaMemcpy(d_coarseCentroids, h_coarseCenters.data(), k_coarse * DIM * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_samples, h_samples.data(), N * DIM * sizeof(float), cudaMemcpyHostToDevice);
 
-        const double tol_coarse = 1e-5;
+        const double tol_coarse = 5e-2;
+        int stable_count_coarse = 0;
         std::vector<float> prev_coarseCenters(k_coarse * DIM, 0.0f);
 
         auto coarse_start = std::chrono::high_resolution_clock::now();
@@ -213,8 +221,14 @@ int main(int argc, char *argv[])
                 }
                 std::cout << "Coarse Iteration " << cur_iter << ": center diff = " << diff << std::endl;
                 if (diff < tol_coarse) {
-                    std::cout << "Coarse clustering converged at iteration " << cur_iter << std::endl;
-                    break;
+                    stable_count_coarse++;
+                    if (stable_count_coarse >= 3) {
+                        std::cout << "Coarse clustering converged at iteration " << cur_iter << std::endl;
+                        break;
+                    }
+                }
+                else {
+                    stable_count_coarse = 0;
                 }
             }
             prev_coarseCenters = h_coarseCenters_out;
@@ -272,7 +286,8 @@ int main(int argc, char *argv[])
             cudaMemset(d_subIndices, -1, sub_N * sizeof(int));
             cudaMemset(d_subSizes, 0, k_fine * sizeof(int));
 
-            const double tol_fine = 1e-4;
+            const double tol_fine = 1e-5;
+            int stable_count_fine = 0;
             std::vector<float> prev_subCentroids(k_fine * DIM, 0.0f);
             std::vector<float> h_subCentroids_out(k_fine * DIM);
 
@@ -291,9 +306,14 @@ int main(int argc, char *argv[])
                     std::cout << "Coarse Cluster " << c << " - Fine Iteration " << cur_iter 
                             << ": center diff = " << diff << std::endl;
                     if (diff < tol_fine) {
-                        std::cout << "Fine clustering converged for coarse cluster " << c 
-                                << " at iteration " << cur_iter << std::endl;
-                        break;
+                        stable_count_fine++;
+                        if (stable_count_fine >= 3) {
+                            std::cout << "Fine clustering converged for coarse cluster " << c << " at iteration " << cur_iter << std::endl;
+                            break;
+                        }
+                    }
+                    else {
+                        stable_count_fine = 0;
                     }
                 }
                 prev_subCentroids = h_subCentroids_out;
@@ -332,6 +352,7 @@ int main(int argc, char *argv[])
         }
         std::cout << "Hierarchical Global SSE: " << hierarchical_global_sse << std::endl;
         std::cout << "Hierarchical total execution time: " << coarse_elapsed.count() + fine_total_elapsed.count() << " ms" << std::endl;
+
 
         // Free coarse clustering GPU memory
         cudaFree(d_samples);

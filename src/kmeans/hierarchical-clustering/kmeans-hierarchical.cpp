@@ -92,7 +92,8 @@ int main(int argc, char *argv[])
 
         // GPU memory assignment
         float *d_samples = nullptr, *d_clusterCenters = nullptr;
-        int *d_clusterIndices = nullptr, *d_clusterSizes = nullptr;
+        int *d_clusterIndices;
+        int *d_clusterSizes = nullptr;
         cudaMalloc(&d_samples, N * DIM * sizeof(float));
         cudaMalloc(&d_clusterIndices, N * sizeof(int));
         cudaMalloc(&d_clusterCenters, K * DIM * sizeof(float));
@@ -111,6 +112,7 @@ int main(int argc, char *argv[])
         const double tol = 1e-4;
         int stable_count = 0;
         std::vector<float> prev_centers(K * DIM, 0.0f);
+        double sse = 0.0;
 
         for (int cur_iter = 1; cur_iter <= MAX_ITER; ++cur_iter) {
             launch_kmeans_labeling(d_samples, d_clusterIndices, d_clusterCenters, N, TPB, K, DIM);
@@ -140,13 +142,42 @@ int main(int argc, char *argv[])
             }
             prev_centers = h_clusterCenters;
 
-            double sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, DIM);
+            sse = compute_SSE(h_samples, h_clusterCenters, std::vector<int>(h_clusterIndices, h_clusterIndices + N), N, K, DIM);
             std::cout << "Iteration " << cur_iter << ": SSE = " << sse << std::endl;
         }
         cudaMemcpy(h_clusterIndices, d_clusterIndices, N * sizeof(int), cudaMemcpyDeviceToHost);
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> elapsed = end - start;
         std::cout << "K-means execution time: " << elapsed.count() << " ms" << std::endl;
+
+        std::vector<int> clusterSizes(K, 0);
+        for (size_t i = 0; i < N; ++i){
+            int idx = h_clusterIndices[i];
+            clusterSizes[idx]++;
+        }
+        
+        // cal the overall centroid of the data
+        std::vector<double> overallMean(DIM, 0.0);
+        for (size_t i = 0; i < N; ++i){
+            for (size_t d = 0; d < DIM; ++d){
+                overallMean[d] += h_samples[i * DIM + d];
+            }
+        }
+        for (size_t d = 0; d < DIM; ++d) overallMean[d] /= N;
+
+        // cal BCSS
+        double B = 0.0;
+        for (size_t ki = 0; ki < K; ++ki) {
+            double dist2 = 0.0;
+            for (size_t d = 0; d < DIM; ++d) {
+                double diff = h_clusterCenters[ki * DIM + d] - overallMean[d];
+                dist2 += diff * diff;
+            }
+            B += clusterSizes[ki] * dist2;
+        }
+        double W = sse;
+        double CH = (B / (K - 1)) / (W / (N - K));
+        std::cout << "Calinski–Harabasz Index: " << CH << std::endl;
 
 #if FileFlag
         std::ofstream File("kmeans_result.txt");
@@ -353,6 +384,45 @@ int main(int argc, char *argv[])
         std::cout << "Hierarchical Global SSE: " << hierarchical_global_sse << std::endl;
         std::cout << "Hierarchical total execution time: " << coarse_elapsed.count() + fine_total_elapsed.count() << " ms" << std::endl;
 
+        // cal points per cluster
+        int M = k_coarse * k_fine;
+        std::vector<int> sz_h(M, 0);
+        for (int i = 0; i < N; ++i) {
+            int ci = h_coarseIndices[i];
+            int fi = h_fineIndices[i];
+            if (ci >= 0 && fi >= 0) {
+                sz_h[ci * k_fine + fi]++;
+            }
+        }
+
+        // cal the overall centroid of the data
+        std::vector<double> overall_h(DIM, 0.0);
+        for (size_t i = 0; i < N; ++i){
+            for (size_t d = 0; d < DIM; ++d) {
+                overall_h[d] += h_samples[i * DIM + d];
+            }
+        }
+        for (std::size_t i = 0; i < overall_h.size(); ++i) {
+            overall_h[i] /= N;
+        }
+
+        // cal BCSS
+        double B_h = 0.0;
+        for (int c = 0; c < k_coarse; ++c) {
+            for (int f = 0; f < k_fine; ++f) {
+                int m = c * k_fine + f;
+                if (sz_h[m] == 0) continue;
+                double dist2 = 0.0;
+                for (size_t d = 0; d < DIM; ++d) {
+                    double df = final_fine_centers[c][f*DIM + d] - overall_h[d];
+                    dist2 += df * df;
+                }
+                B_h += sz_h[m] * dist2;
+            }
+        }
+        double W_h = hierarchical_global_sse;
+        double CH_h = (B_h / (M - 1)) / (W_h / (N - M)); // cal CH index
+        std::cout << "Calinski–Harabasz Index (Hierarchical): " << CH_h << std::endl;
 
         // Free coarse clustering GPU memory
         cudaFree(d_samples);

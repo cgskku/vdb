@@ -27,8 +27,8 @@ void generate_sample_data(
 
     h_data.resize(N * DIM);
 
-    for (std::size_t n = 0; n < N; ++n) {
-        for (std::size_t dim = 0; dim < DIM; ++dim) {
+    for(std::size_t n = 0; n < N; ++n){
+        for(std::size_t dim = 0; dim < DIM; ++dim){
             h_data[n * DIM + dim] = vecUnit(generator);
         }
     }
@@ -42,7 +42,7 @@ int main(int argc, char *argv[])
 {
     std::cout.precision(10);
 
-    if (argc != 3) {
+    if(argc != 3){
         std::cerr << "Usage: " << argv[0] << " <N> <dimension>" << std::endl;
         return 1;
     }
@@ -81,7 +81,7 @@ int main(int argc, char *argv[])
     cudaMemcpy(h_output.data(), d_output, N * sizeof(float), cudaMemcpyDeviceToHost);
 
     std::cout << "[0] Cosine similarity result vs all:\n";
-    for (int i = 0; i < std::min(N, size_t(10)); ++i)
+    for(int i = 0; i < std::min(N, 10); i++)
         std::cout << "sim[0][" << i << "] = " << h_output[i] << "\n";
 
     // clean up

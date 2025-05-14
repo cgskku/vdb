@@ -1,3 +1,18 @@
 # vc temporary files
 *.vcxproj.user
 
+# ignore all text files
+*.txt
+
+# ignore nvprof profile outputs
+*.nvprof
+
+# compiled object, libraries, executables
+*.obj
+*.o
+*.so
+*.a
+*.lib
+*.dll
+*.exe
+*.out

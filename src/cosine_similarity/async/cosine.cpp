@@ -5,6 +5,8 @@
 #include <cuda_runtime.h>
 #include "cosine.h"
 
+#define FileFlag 1
+
 int main(int argc, char *argv[])
 {
     std::cout.precision(10);
@@ -32,7 +34,11 @@ int main(int argc, char *argv[])
     // Allocate input data on device input은 h_samples의 첫 번째 벡터
     float* d_input = nullptr;
     cudaMalloc(&d_input, dimension * sizeof(float));
-    cudaMemcpyAsync(d_input, h_samples.data(), dimension * sizeof(float), cudaMemcpyHostToDevice, stream[0]);
+    cudaMemcpyAsync(d_input, &h_samples[0], dimension * sizeof(float), cudaMemcpyHostToDevice, stream[0]);
+
+    // float *d_samples_pinned = nullptr, *d_output_pinned = nullptr;
+    // cudaMallocHost((void**)&d_samples_pinned, fixed_mini_batches_size * dimension * sizeof(float));
+    // cudaMallocHost((void**)&d_output_pinned, fixed_mini_batches_size * sizeof(float));
 
     for(int batch_index = 0; batch_index < num_mini_batches; batch_index++){
         std::size_t start_index = batch_index * fixed_mini_batches_size;
@@ -47,7 +53,7 @@ int main(int argc, char *argv[])
         // Copy data to device
         const float *h_samples_ptr = h_samples.data() + start_index * dimension;
         cudaMemcpyAsync(d_samples, h_samples_ptr, batch_size * dimension * sizeof(float), cudaMemcpyHostToDevice, stream[batch_index]);
-
+ 
         // Launch kernel
         launch_cosine_similarity(d_samples, d_input, d_output, batch_size, dimension, TPB, stream[batch_index]);
 
@@ -58,12 +64,18 @@ int main(int argc, char *argv[])
         // free device memory
         cudaFreeAsync(d_samples, stream[batch_index]);
         cudaFreeAsync(d_output, stream[batch_index]);
+        // cudaStreamSynchronize(stream[batch_index]);
     }
 
     for(int i = 0; i < num_mini_batches; i++){
         cudaStreamSynchronize(stream[i]);
         cudaStreamDestroy(stream[i]);
     }
+
+    // Free device memory
+    // cudaFree(d_samples_pinned);
+    // cudaFree(d_output_pinned);
+    cudaFree(d_input);
 
     auto total_kernel_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> total_kernel_elapsed = total_kernel_end - total_kernel_start;
@@ -74,6 +86,14 @@ int main(int argc, char *argv[])
         std::cout << "sim[0][" << i << "] = " << h_output[i] << "\n";
     }
 
-    cudaFree(d_input);
+#if FileFlag
+    std::ofstream File("cosine_result.txt");
+    // Write final results to File
+    for(int i = 0; i < N; i++){
+        File << "sim[0][" << i << "] = " << h_output[i] << "\n";
+    }
+    File.close();
+#endif
+
     return 0;
 }

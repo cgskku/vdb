@@ -12,6 +12,8 @@
 
 #include "cosine.h"
 
+#define FileFlag 0
+
 // Function to generate clustered data
 template<typename VecType = float>
 void generate_sample_data(
@@ -75,6 +77,15 @@ int main(int argc, char *argv[])
     std::cout << "[0] Cosine similarity result vs all:\n";
     for(int i = 0; i < std::min(N, (size_t)10); i++)
         std::cout << "sim[0][" << i << "] = " << h_output[i] << "\n";
+
+#if FileFlag
+    std::ofstream File("cosine_result.txt");
+    // Write final results to File
+    for(int i = 0; i < N; i++){
+        File << "sim[0][" << i << "] = " << h_output[i] << "\n";
+    }
+    File.close();
+#endif
 
     // clean up
     cudaFree(d_samples);

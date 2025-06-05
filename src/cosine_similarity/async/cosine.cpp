@@ -5,7 +5,7 @@
 #include <cuda_runtime.h>
 #include "cosine.h"
 
-#define FileFlag 1
+#define FileFlag 0
 
 int main(int argc, char *argv[])
 {
@@ -14,15 +14,16 @@ int main(int argc, char *argv[])
     std::size_t dimension = 1536; // Dimension of data points
 
     int TPB = 128;
-    int fixed_mini_batches_size = 100000;
+    int fixed_mini_batches_size = 10000;
     int num_mini_batches = (N + fixed_mini_batches_size - 1) / fixed_mini_batches_size;
 
     std::vector<float> h_samples(N * dimension);
     std::vector<float> h_output(N);
 
     // Generate data
+    std::cout << "=== generate_sample_data ===" << std::endl;
     generate_sample_data(h_samples, N, dimension);
-    std::cout << "Kernel Start" << std::endl;
+    std::cout << "=== async code Start ===" << std::endl;
     auto total_kernel_start = std::chrono::high_resolution_clock::now();
 
     // Create CUDA streams
@@ -36,10 +37,7 @@ int main(int argc, char *argv[])
     cudaMalloc(&d_input, dimension * sizeof(float));
     cudaMemcpyAsync(d_input, &h_samples[0], dimension * sizeof(float), cudaMemcpyHostToDevice, stream[0]);
 
-    // float *d_samples_pinned = nullptr, *d_output_pinned = nullptr;
-    // cudaMallocHost((void**)&d_samples_pinned, fixed_mini_batches_size * dimension * sizeof(float));
-    // cudaMallocHost((void**)&d_output_pinned, fixed_mini_batches_size * sizeof(float));
-
+    auto total_for_start = std::chrono::high_resolution_clock::now();
     for(int batch_index = 0; batch_index < num_mini_batches; batch_index++){
         std::size_t start_index = batch_index * fixed_mini_batches_size;
         std::size_t end_index = std::min(start_index + fixed_mini_batches_size, N);
@@ -73,13 +71,13 @@ int main(int argc, char *argv[])
     }
 
     // Free device memory
-    // cudaFree(d_samples_pinned);
-    // cudaFree(d_output_pinned);
     cudaFree(d_input);
 
     auto total_kernel_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> total_kernel_elapsed = total_kernel_end - total_kernel_start;
-    std::cout << "Async Kernel time: " << total_kernel_elapsed.count() << " ms" << std::endl;
+    std::chrono::duration<double, std::milli> total_for_elapsed = total_kernel_end - total_for_start;
+    std::cout << "async loop time: " << total_for_elapsed.count() << " ms" << std::endl;
+    std::cout << "async code time: " << total_kernel_elapsed.count() << " ms" << std::endl;
 
     std::cout << "[0] Cosine similarity result vs all:\n";
     for(int i = 0; i < std::min(N, (size_t)10); i++){

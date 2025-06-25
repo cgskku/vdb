@@ -36,15 +36,12 @@ int main(int argc, char *argv[])
     std::cout << "asyncEngineCount: " << deviceProp.asyncEngineCount << "\n";
 
     const int num_streams = deviceProp.asyncEngineCount;
-    const int num_pools = 16;
-
     std::vector<cudaStream_t> stream(num_streams);
-
-    std::vector<cudaEvent_t> events(num_pools);
-    std::vector<float*> h_in_pinned(num_pools);
-    std::vector<float*> h_out_pinned(num_pools);
-    std::vector<float*> d_batches(num_pools);
-    std::vector<float*> d_outputs(num_pools);
+    std::vector<cudaEvent_t> events(num_streams);
+    std::vector<float*> h_in_pinned(num_streams);
+    std::vector<float*> h_out_pinned(num_streams);
+    std::vector<float*> d_batches(num_streams);
+    std::vector<float*> d_outputs(num_streams);
 
     std::vector<float> h_samples(N * dimension);
     std::vector<float> h_output(N);
@@ -55,9 +52,6 @@ int main(int argc, char *argv[])
 
     for(int i = 0; i < num_streams; i++){
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream[i], cudaStreamNonBlocking));
-    }
-
-    for(int i = 0; i < num_pools; i++){
         CUDA_CHECK(cudaEventCreate(&events[i]));
         CUDA_CHECK(cudaHostAlloc(&h_in_pinned[i], fixed_batch_size * dimension * sizeof(float), cudaHostAllocDefault));
         CUDA_CHECK(cudaHostAlloc(&h_out_pinned[i], fixed_batch_size * sizeof(float), cudaHostAllocDefault));
@@ -70,42 +64,32 @@ int main(int argc, char *argv[])
     cudaMemcpyAsync(d_input, &h_samples[0], dimension * sizeof(float), cudaMemcpyHostToDevice, stream[0]);
 
     auto total_for_start = std::chrono::high_resolution_clock::now();
-    int input_slot = 0; // buffer slot index
-    for(int i = 0; i < num_batches; ++i) {
+    // num_batches = 2
+    for(int i = 0; i < num_batches; i++){
+        int cur = i % num_streams;
+
         std::size_t start_idx = i * fixed_batch_size;
         std::size_t end_idx = std::min(start_idx + fixed_batch_size, N);
         std::size_t batch_size = end_idx - start_idx;
 
-        int stream_idx = i % num_streams;
-        int slot = input_slot % num_pools;
+        // CUDA_CHECK(cudaEventSynchronize(events[cur]));
 
-        if(i >= num_pools){
-            if(cudaEventQuery(events[slot]) != cudaSuccess){
-                CUDA_CHECK(cudaEventSynchronize(events[slot]));
-            }
-            std::memcpy(h_output.data() + slot * fixed_batch_size, h_out_pinned[slot], fixed_batch_size * sizeof(float));
-        }
+        std::memcpy(h_in_pinned[cur], h_samples.data() + start_idx * dimension, batch_size * dimension * sizeof(float));
 
-        std::memcpy(h_in_pinned[slot], h_samples.data() + start_idx * dimension, batch_size * dimension * sizeof(float));
-        CUDA_CHECK(cudaMemcpyAsync(d_batches[slot], h_in_pinned[slot], batch_size * dimension * sizeof(float), cudaMemcpyHostToDevice, stream[stream_idx]));
+        CUDA_CHECK(cudaMemcpyAsync(d_batches[cur], h_in_pinned[cur],
+            batch_size * dimension * sizeof(float), cudaMemcpyHostToDevice, stream[cur]));
 
-        launch_cosine_similarity(d_batches[slot], d_input, d_outputs[slot], batch_size, dimension, TPB, stream[stream_idx]);
+        launch_cosine_similarity(d_batches[cur], d_input, d_outputs[cur],
+            batch_size, dimension, TPB, stream[cur]);
 
-        CUDA_CHECK(cudaMemcpyAsync(h_out_pinned[slot], d_outputs[slot], batch_size * sizeof(float), cudaMemcpyDeviceToHost, stream[stream_idx]));
-        CUDA_CHECK(cudaEventRecord(events[slot], stream[stream_idx]));
+        CUDA_CHECK(cudaMemcpyAsync(h_out_pinned[cur], d_outputs[cur],
+            batch_size * sizeof(float), cudaMemcpyDeviceToHost, stream[cur]));
 
-        input_slot++;
+        CUDA_CHECK(cudaEventRecord(events[cur], stream[cur]));
+        CUDA_CHECK(cudaEventSynchronize(events[cur]));
+        std::memcpy(h_output.data() + start_idx, h_out_pinned[cur], batch_size * sizeof(float));
     }
 
-    // flush remaining stream
-    for (int j = std::max(0, input_slot - num_pools); j < input_slot; ++j) {
-        int slot = j % num_pools;
-        CUDA_CHECK(cudaEventSynchronize(events[slot]));
-        std::size_t start_idx = j * fixed_batch_size;
-        std::size_t end_idx = std::min(start_idx + fixed_batch_size, N);
-        std::size_t batch_size = end_idx - start_idx;
-        std::memcpy(h_output.data() + start_idx, h_out_pinned[slot], batch_size * sizeof(float));
-    }
     auto total_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> elapsed = total_end - total_start;
     std::chrono::duration<double, std::milli> for_elapsed = total_end - total_for_start;

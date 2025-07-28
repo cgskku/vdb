@@ -93,3 +93,18 @@ void launch_pairwise_distance_kernel(const float *d_db_vectors, float *d_pairwis
     dim3 grid((N + block.x - 1) / block.x, (N + block.y - 1) / block.y);
     pairwise_distance_kernel<<<grid, block>>>(d_db_vectors, d_pairwise, N, DIM);
 }
+
+__global__ void pairwise_distance_tile_kernel(const float* db_vectors, const float* db_vectors2, float* tile_out, int N, int DIM, int row_offset, int col_offset, int tile_rows, int tile_cols) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < tile_rows && col < tile_cols) {
+        int idx_i = row_offset + row;
+        int idx_j = col_offset + col;
+        tile_out[row * tile_cols + col] =
+            get_distance_l2(db_vectors + idx_i * DIM, db_vectors2 + idx_j * DIM, DIM);
+    }
+}
+
+void launch_pairwise_distance_tile_kernel(const float* d_db_vectors, const float* d_db_vectors2, float* d_tile, int N, int DIM, int row_offset, int col_offset, int tile_rows, int tile_cols, dim3 block, dim3 grid) {
+    pairwise_distance_tile_kernel<<<grid, block>>>(d_db_vectors, d_db_vectors2, d_tile, N, DIM, row_offset, col_offset, tile_rows, tile_cols);
+}

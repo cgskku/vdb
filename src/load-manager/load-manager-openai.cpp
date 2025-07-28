@@ -118,16 +118,15 @@ void print_gpu_memory_info(int total_check) {
 
 int main(int argc, char *argv[])
 {
-    if (argc < 6) {
-        std::cerr << "Usage: " << argv[0] << " N TPB K DIM norm_type(l1|l2|cosine)\n";
+    if (argc < 4) {
+        std::cerr << "Usage: " << argv[0] << " file_path TPB norm_type(l1|l2|cosine)\n";
         return 1;
     }
 
     std::string file_path = argv[1];
     int TPB = std::atoi(argv[2]); 
-    std::size_t K = std::atoi(argv[3]); 
-    std::size_t DIM = std::atoi(argv[4]);
-    std::string norm_str = argv[5];
+    // std::size_t DIM = std::atoi(argv[3]);
+    std::string norm_str = argv[3];
 
     NormType normType;
     if (norm_str == "l1" || norm_str == "L1") normType = L1_NORM;
@@ -146,16 +145,15 @@ int main(int argc, char *argv[])
     std::cout << "Max threads per block: " << prop.maxThreadsPerBlock << std::endl;
     std::cout << "Shared memory per block: " << prop.sharedMemPerBlock << std::endl;
     std::cout << "Registers per block: " << prop.regsPerBlock << std::endl;
-
-    print_cpu_memory_info(0);
+    std::cout << "--------------------------------------------------" << std::endl;
 
     std::size_t N = 0; // Number of data points
-    std::size_t dimension = DIM; // Dimension of data points
+    std::size_t dimension = 0; // Dimension of data points
     std::cout << "Loading Start"  << std::endl;
     std::vector<std::pair<int64_t, std::vector<float>>> data =  load_parquet_id_emb_pairs(file_path, N, dimension);
-    std::cout << "[Info] Loaded vectors: " << N << " × " << DIM << std::endl;
+    std::cout << "[Info] Loaded vectors: " << N << " × " << dimension << std::endl;
+    print_cpu_memory_info(0);
 
-    // 앞에서 3개 벡터만 출력
     for (std::size_t i = 0; i < std::min<std::size_t>(3, data.size()); ++i) {
         std::cout << "ID " << data[i].first << ", Embedding: ";
         for (std::size_t j = 0; j < std::min<std::size_t>(5, data[i].second.size()); ++j) {
@@ -163,77 +161,74 @@ int main(int argc, char *argv[])
         }
         std::cout << "..." << std::endl;
     }
+    std::cout << "--------------------------------------------------" << std::endl;
 
     float *d_db_vectors, *d_dists;
-    cudaError_t err = cudaMalloc(&d_db_vectors, N * DIM * sizeof(float));
+    cudaError_t err = cudaMalloc(&d_db_vectors, N * dimension * sizeof(float));
     if (err != cudaSuccess) {
         std::cerr << "[Error] cudaMalloc failed for d_db_vectors: " << cudaGetErrorString(err) << std::endl;
         return 1;
     }
-
-
     cudaMalloc(&d_dists, N * sizeof(float));
+
+    size_t tile_size = 10000; // tile 크기 - for tile-based pairwise distance cal.
+    size_t num_tiles = (N + tile_size - 1) / tile_size; // for tile-based pairwise distance cal.
+    std::vector<float> h_tile(tile_size * tile_size); // for store results for each tile
+    size_t h_tile_bytes = h_tile.size() * sizeof(float);
+    std::cout << "[Info] h_tile size: " << h_tile.size() << " (bytes: " << h_tile_bytes << ", MB: " << h_tile_bytes / (1024 * 1024) << ")\n";
+    print_cpu_memory_info(0);
+    std::cout << "--------------------------------------------------" << std::endl;
 
     std::vector<float> flat_data(N * dimension);
     for (std::size_t i = 0; i < N; ++i)
         std::copy(data[i].second.begin(), data[i].second.end(), flat_data.begin() + i * dimension);
     size_t data_bytes = flat_data.size() * sizeof(float);
     std::cout << "[Info] data size: " << flat_data.size() << " (bytes: " << data_bytes << ", MB: " << data_bytes / (1024 * 1024) << ")\n";
-
     cudaMemcpy(d_db_vectors, flat_data.data(), N * dimension * sizeof(float), cudaMemcpyHostToDevice);
+    std::cout << "--------------------------------------------------" << std::endl;
 
-    // gpu
-    float *d_pairwise;
-    cudaError_t err2 = cudaMalloc(&d_pairwise, N * N * sizeof(float));
-    if (err2 != cudaSuccess) {
-        std::cerr << "[Error] cudaMalloc failed for d_pairwise: " << cudaGetErrorString(err2) << std::endl;
-        return 1;
+    // tile-based pairwise distance cal.
+    for (size_t tile_i = 0; tile_i < num_tiles; ++tile_i) {
+        for (size_t tile_j = 0; tile_j < num_tiles; ++tile_j) {
+            size_t row_start = tile_i * tile_size;
+            size_t col_start = tile_j * tile_size;
+            size_t tile_rows = std::min(tile_size, N - row_start);
+            size_t tile_cols = std::min(tile_size, N - col_start);
+
+            float *d_tile;
+            size_t d_tile_bytes = tile_rows * tile_cols * sizeof(float);
+            double d_tile_MB = (double)d_tile_bytes / (1024.0 * 1024.0);
+            
+            if (tile_i == 0 && tile_j == 0) {
+                std::cout << "[Info] d_tile allocation size: "  << d_tile_bytes << " bytes (" << std::fixed << std::setprecision(2) << d_tile_MB << " MB)" << std::endl;
+            }
+
+            cudaError_t err_d_tile = cudaMalloc(&d_tile, d_tile_bytes);
+            if (err_d_tile != cudaSuccess) {
+                std::cerr << "[Error] cudaMalloc failed for d_tile: " << cudaGetErrorString(err_d_tile) << std::endl;
+                return 1;
+            }
+
+            dim3 block(16, 16);
+            dim3 grid((tile_cols + block.x - 1) / block.x, (tile_rows + block.y - 1) / block.y);
+
+            launch_pairwise_distance_tile_kernel(d_db_vectors, d_db_vectors, d_tile, N, dimension, row_start, col_start, tile_rows, tile_cols, block, grid);
+
+            cudaMemcpy(h_tile.data(), d_tile, tile_rows * tile_cols * sizeof(float), cudaMemcpyDeviceToHost);
+
+            if (tile_i == (num_tiles-1) && tile_j == (num_tiles-1)) {
+                std::cout << "[Tile num_tiles-1,num_tiles-1] pairwise sample:\n";
+                for (int r = 0; r < std::min<size_t>(7, tile_rows); ++r) {
+                    for (int c = 0; c < std::min<size_t>(7, tile_cols); ++c)
+                        std::cout << h_tile[r * tile_cols + c] << " ";
+                    std::cout << std::endl;
+                }
+            }
+
+            cudaFree(d_tile);
+        }
     }
+    cudaFree(d_db_vectors);
 
-    std::size_t size_in_bytes = N * N * sizeof(float);
-    std::size_t size_in_MB = size_in_bytes / (1024 * 1024);
-    std::cout << "d_pairwise size: " << size_in_bytes << " bytes (" << size_in_MB << " MB)" << std::endl;
-
-    int blockX = 32, blockY = 32;
-
-    cudaEvent_t t0, t1;
-    cudaEventCreate(&t0); cudaEventCreate(&t1);
-    cudaEventRecord(t0, 0);
-
-    print_gpu_memory_info(0);
-
-    launch_pairwise_distance_kernel(d_db_vectors, d_pairwise, N, DIM, normType, blockX, blockY);
-    cudaError_t kernel_err = cudaGetLastError();
-    if (kernel_err != cudaSuccess) {
-        std::cerr << "[Error] pairwise_distance_kernel launch failed: " << cudaGetErrorString(kernel_err) << std::endl;
-    }
-    cudaDeviceSynchronize();
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::cerr << "[CUDA ERROR after synchronize] " << cudaGetErrorString(err) << std::endl;
-    }
-
-    cudaEventRecord(t1, 0);
-    cudaEventSynchronize(t1);
-
-    float pw_msec = 0;
-    cudaEventElapsedTime(&pw_msec, t0, t1);
-    std::cout << std::fixed << std::setprecision(4);
-    std::cout << "[GPU] Pairwise (all-to-all) distance matrix computed in " << pw_msec << " ms" << std::endl;
-    cudaEventDestroy(t0); cudaEventDestroy(t1);
-
-    std::vector<float> h_pairwise(std::min<size_t>((size_t)N*N, 100));
-    cudaMemcpy(h_pairwise.data(), d_pairwise, h_pairwise.size() * sizeof(float), cudaMemcpyDeviceToHost);
-
-    std::cout << "[GPU] Pairwise distance sample (first 3x3):" << std::endl;
-    for (int i = 0; i < std::min<int>(3, N); ++i) {
-        for (int j = 0; j < std::min<int>(3, N); ++j)
-            std::cout << h_pairwise[i*N + j] << " ";
-        std::cout << std::endl;
-    }
-
-    cudaFree(d_pairwise);
-    cudaFree(d_db_vectors); cudaFree(d_dists);
-    
     return 0;
 }

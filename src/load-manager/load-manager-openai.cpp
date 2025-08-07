@@ -150,10 +150,15 @@ int main(int argc, char *argv[])
     std::size_t N = 0; // Number of data points
     std::size_t dimension = 0; // Dimension of data points
     std::cout << "Loading Start"  << std::endl;
+    auto data_loading_start_time = std::chrono::high_resolution_clock::now();
     std::vector<std::pair<int64_t, std::vector<float>>> data =  load_parquet_id_emb_pairs(file_path, N, dimension);
+    auto data_loading_end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> total_loading_time = data_loading_end_time - data_loading_start_time;
+    std::cout << "[Time] Data loading took " << total_loading_time.count() << " seconds.\n";
     std::cout << "[Info] Loaded vectors: " << N << " × " << dimension << std::endl;
     print_cpu_memory_info(0);
 
+    // 앞에서 3개 벡터만 출력
     for (std::size_t i = 0; i < std::min<std::size_t>(3, data.size()); ++i) {
         std::cout << "ID " << data[i].first << ", Embedding: ";
         for (std::size_t j = 0; j < std::min<std::size_t>(5, data[i].second.size()); ++j) {
@@ -186,6 +191,9 @@ int main(int argc, char *argv[])
     std::cout << "[Info] data size: " << flat_data.size() << " (bytes: " << data_bytes << ", MB: " << data_bytes / (1024 * 1024) << ")\n";
     cudaMemcpy(d_db_vectors, flat_data.data(), N * dimension * sizeof(float), cudaMemcpyHostToDevice);
     std::cout << "--------------------------------------------------" << std::endl;
+
+    std::cout << "Start tile-based pairwise distance calculation..." << std::endl;
+    auto tile_start_time = std::chrono::high_resolution_clock::now();
 
     // tile-based pairwise distance cal.
     for (size_t tile_i = 0; tile_i < num_tiles; ++tile_i) {
@@ -228,6 +236,11 @@ int main(int argc, char *argv[])
             cudaFree(d_tile);
         }
     }
+    
+    auto tile_end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed_tile = tile_end_time - tile_start_time;
+    std::cout << "[Time] Tile-based pairwise distance calculation took " << elapsed_tile.count() << " seconds.\n";
+
     cudaFree(d_db_vectors);
 
     return 0;

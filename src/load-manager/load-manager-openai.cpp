@@ -30,7 +30,7 @@ std::vector<std::pair<int64_t, std::vector<float>>> load_parquet_id_emb_pairs(co
 
         // 2. Create reader
         std::unique_ptr<parquet::arrow::FileReader> arrow_reader;
-        PARQUET_THROW_NOT_OK(parquet::arrow::OpenFile(infile, arrow::default_memory_pool(), &arrow_reader));
+        PARQUET_ASSIGN_OR_THROW(arrow_reader, parquet::arrow::OpenFile(infile, arrow::default_memory_pool()));
         std::cout << "[Debug] Create Arrow reader" << std::endl;
 
         // 3. Get schema and indices

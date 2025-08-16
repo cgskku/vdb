@@ -206,6 +206,16 @@ int main(int argc, char *argv[])
             float *d_tile;
             size_t d_tile_bytes = tile_rows * tile_cols * sizeof(float);
             double d_tile_MB = (double)d_tile_bytes / (1024.0 * 1024.0);
+
+            std::vector<float> col_tile_T(dimension * tile_cols);
+            for (size_t col = 0; col < tile_cols; ++col) {
+                for (size_t d = 0; d < dimension; ++d) {
+                    col_tile_T[d * tile_cols + col] = flat_data[(col_start + col) * dimension + d];
+                }
+            }
+            float* d_col_tile_T;
+            cudaMalloc(&d_col_tile_T, dimension * tile_cols * sizeof(float));
+            cudaMemcpy(d_col_tile_T, col_tile_T.data(), dimension * tile_cols * sizeof(float), cudaMemcpyHostToDevice);
             
             if (tile_i == 0 && tile_j == 0) {
                 std::cout << "[Info] d_tile allocation size: "  << d_tile_bytes << " bytes (" << std::fixed << std::setprecision(2) << d_tile_MB << " MB)" << std::endl;
@@ -220,7 +230,7 @@ int main(int argc, char *argv[])
             dim3 block(16, 16);
             dim3 grid((tile_cols + block.x - 1) / block.x, (tile_rows + block.y - 1) / block.y);
 
-            launch_pairwise_distance_tile_kernel(d_db_vectors, d_db_vectors, d_tile, N, dimension, row_start, col_start, tile_rows, tile_cols, block, grid);
+            launch_pairwise_distance_tile_kernel_transpose(d_db_vectors, d_col_tile_T, d_tile, N, dimension, row_start, tile_rows, tile_cols, block, grid);
 
             cudaMemcpy(h_tile.data(), d_tile, tile_rows * tile_cols * sizeof(float), cudaMemcpyDeviceToHost);
 
@@ -234,6 +244,7 @@ int main(int argc, char *argv[])
             }
 
             cudaFree(d_tile);
+            cudaFree(d_col_tile_T);
         }
     }
     

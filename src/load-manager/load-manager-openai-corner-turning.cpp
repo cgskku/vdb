@@ -196,31 +196,36 @@ int main(int argc, char *argv[])
     auto tile_start_time = std::chrono::high_resolution_clock::now();
 
     // tile-based pairwise distance cal.
-    for (size_t tile_i = 0; tile_i < num_tiles; ++tile_i) {
-        for (size_t tile_j = 0; tile_j < num_tiles; ++tile_j) {
-            size_t row_start = tile_i * tile_size;
-            size_t col_start = tile_j * tile_size;
-            size_t tile_rows = std::min(tile_size, N - row_start);
-            size_t tile_cols = std::min(tile_size, N - col_start);
+    for (size_t tile_j = 0; tile_j < num_tiles; ++tile_j) {
+        size_t col_start = tile_j * tile_size;
+        size_t tile_cols  = std::min(tile_size, N - col_start);
 
-            float *d_tile;
+        std::vector<float> col_tile_T(dimension * tile_cols);
+        for (size_t col = 0; col < tile_cols; ++col) {
+            const float* src = flat_data.data() + (col_start + col) * dimension;
+            for (size_t d = 0; d < dimension; ++d) {
+                col_tile_T[d * tile_cols + col] = src[d];
+            }
+        }
+
+        float* d_col_tile_T = nullptr;
+        cudaError_t err_colT = cudaMalloc(&d_col_tile_T, dimension * tile_cols * sizeof(float));
+        if (err_colT != cudaSuccess) {
+            std::cerr << "[Error] cudaMalloc failed for d_col_tile_T: " << cudaGetErrorString(err_colT) << std::endl;
+            return 1;
+        }
+        cudaMemcpy(d_col_tile_T, col_tile_T.data(), dimension * tile_cols * sizeof(float), cudaMemcpyHostToDevice);
+
+        for (size_t tile_i = 0; tile_i < num_tiles; ++tile_i) {
+            size_t row_start = tile_i * tile_size;
+            size_t tile_rows = std::min(tile_size, N - row_start);
+
+            float *d_tile = nullptr;
             size_t d_tile_bytes = tile_rows * tile_cols * sizeof(float);
             double d_tile_MB = (double)d_tile_bytes / (1024.0 * 1024.0);
-
-            std::vector<float> col_tile_T(dimension * tile_cols);
-            for (size_t col = 0; col < tile_cols; ++col) {
-                for (size_t d = 0; d < dimension; ++d) {
-                    col_tile_T[d * tile_cols + col] = flat_data[(col_start + col) * dimension + d];
-                }
-            }
-            float* d_col_tile_T;
-            cudaMalloc(&d_col_tile_T, dimension * tile_cols * sizeof(float));
-            cudaMemcpy(d_col_tile_T, col_tile_T.data(), dimension * tile_cols * sizeof(float), cudaMemcpyHostToDevice);
-            
             if (tile_i == 0 && tile_j == 0) {
                 std::cout << "[Info] d_tile allocation size: "  << d_tile_bytes << " bytes (" << std::fixed << std::setprecision(2) << d_tile_MB << " MB)" << std::endl;
             }
-
             cudaError_t err_d_tile = cudaMalloc(&d_tile, d_tile_bytes);
             if (err_d_tile != cudaSuccess) {
                 std::cerr << "[Error] cudaMalloc failed for d_tile: " << cudaGetErrorString(err_d_tile) << std::endl;
@@ -230,22 +235,23 @@ int main(int argc, char *argv[])
             dim3 block(16, 16);
             dim3 grid((tile_cols + block.x - 1) / block.x, (tile_rows + block.y - 1) / block.y);
 
-            launch_pairwise_distance_tile_kernel_transpose(d_db_vectors, d_col_tile_T, d_tile, N, dimension, row_start, tile_rows, tile_cols, block, grid);
+            launch_pairwise_distance_tile_kernel_transpose(d_db_vectors, d_col_tile_T, d_tile, (int)N, (int)dimension, (int)row_start, (int)tile_rows, (int)tile_cols, block, grid);
 
-            cudaMemcpy(h_tile.data(), d_tile, tile_rows * tile_cols * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_tile.data(), d_tile, d_tile_bytes, cudaMemcpyDeviceToHost);
 
             if (tile_i == (num_tiles-1) && tile_j == (num_tiles-1)) {
                 std::cout << "[Tile num_tiles-1,num_tiles-1] pairwise sample:\n";
-                for (int r = 0; r < std::min<size_t>(7, tile_rows); ++r) {
-                    for (int c = 0; c < std::min<size_t>(7, tile_cols); ++c)
+                for (int r = 0; r < std::min<std::size_t>(7, tile_rows); ++r) {
+                    for (int c = 0; c < std::min<std::size_t>(7, tile_cols); ++c)
                         std::cout << h_tile[r * tile_cols + c] << " ";
                     std::cout << std::endl;
                 }
             }
 
             cudaFree(d_tile);
-            cudaFree(d_col_tile_T);
         }
+
+        cudaFree(d_col_tile_T);
     }
     
     auto tile_end_time = std::chrono::high_resolution_clock::now();

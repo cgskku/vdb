@@ -151,3 +151,15 @@ void launch_pairwise_distance_tile_kernel_transpose(
         d_db_vectors, d_db_vectors2_T, d_tile, N, DIM,
         row_offset, 0, tile_rows, tile_cols);
 }
+
+void launch_pairwise_distance_tile_kernel_transpose_stream(
+    const float* d_db_vectors, const float* d_db_vectors2_T,
+    float* d_tile,
+    int N, int DIM,
+    int row_offset, int tile_rows, int tile_cols,
+    dim3 block, dim3 grid, cudaStream_t stream)
+{
+    pairwise_distance_tile_kernel_transpose<<<grid, block, 0, stream>>>(
+        d_db_vectors, d_db_vectors2_T, d_tile, N, DIM,
+        row_offset, 0, tile_rows, tile_cols);
+}

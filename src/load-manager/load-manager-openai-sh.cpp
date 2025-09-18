@@ -195,17 +195,17 @@ int main(int argc, char *argv[])
         std::cerr << "[Error] cudaMalloc failed for d_db_vectors: " << cudaGetErrorString(err) << std::endl;
         return 1;
     }
-    //cudaMalloc(&d_dists, N * sizeof(float));
 
     size_t tile_size = 10000; // for tile-based pairwise distance cal.
     size_t num_tiles = (N + tile_size - 1) / tile_size; // for tile-based pairwise distance cal.
-    // std::vector<float> h_tile(tile_size * tile_size); // for store results for each tile
-    // size_t h_tile_bytes = h_tile.size() * sizeof(float);
-    // std::cout << "[Info] h_tile size: " << h_tile.size() << " (bytes: " << h_tile_bytes << ", MB: " << h_tile_bytes / (1024 * 1024) << ")\n";
     print_cpu_memory_info(0);
 
     std::cout << "--------------------------------------------------" << std::endl;
+    
+    size_t max_tile_rows = std::min(tile_size, N); // 10,000 vs 500,000
+    size_t max_tile_cols = std::min(tile_size, N);
 
+    // CPU + pinned
     std::vector<float> flat_data(N * dimension);
     for (std::size_t i = 0; i < N; ++i)
         std::copy(data[i].second.begin(), data[i].second.end(), flat_data.begin() + i * dimension);
@@ -214,40 +214,42 @@ int main(int argc, char *argv[])
     std::cout << "[Info] data size: " << flat_data.size() << " (bytes: " << data_bytes << ", MB: " << data_bytes / (1024 * 1024) << ")\n";
     cudaMemcpy(d_db_vectors, flat_data.data(), N * dimension * sizeof(float), cudaMemcpyHostToDevice); // gpu: d_db_vectors <- cpu: flat_data
 
-    
 
-
-
-    size_t max_tile_rows = std::min(tile_size, N); // 10,000 vs 500,000
-    size_t max_tile_cols = std::min(tile_size, N);
+    float* h_col_tile_T = nullptr; // H2D 전송 용 buffer - staging 없이 바로 GPU가 read
+    CUDA_CHECK(cudaMallocHost((void**)&h_col_tile_T, dimension * max_tile_cols * sizeof(float)));
+    // float* h_tile = nullptr;
+    // CUDA_CHECK(cudaMallocHost((void**)&h_tile, max_tile_rows * max_tile_cols * sizeof(float)));
+    float* h_tile[2] = {nullptr, nullptr}; // 결과를 D2H로 받아 저장
+    CUDA_CHECK(cudaMallocHost((void**)&h_tile[0], max_tile_rows * max_tile_cols * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost((void**)&h_tile[1], max_tile_rows * max_tile_cols * sizeof(float)));
 
     // GPU  
     float* d_col_tile_T = nullptr; // H2D하고, 루프 동안 계속 재사용
     CUDA_CHECK(cudaMalloc(&d_col_tile_T, dimension * max_tile_cols * sizeof(float)));
-    float* d_tile = nullptr; // 임시 버퍼, 끝나고 D2H로 h_tile로
-    CUDA_CHECK(cudaMalloc(&d_tile, max_tile_rows * max_tile_cols * sizeof(float)));
+    // float* d_tile = nullptr;
+    // CUDA_CHECK(cudaMalloc(&d_tile, max_tile_rows * max_tile_cols * sizeof(float)));
 
-    // CPU + pinned
-    float* h_col_tile_T = nullptr; // H2D 전송 용 buffer - staging 없이 바로 GPU가 read
-    float* h_tile = nullptr; // 결과를 D2H로 받아 저장
-    CUDA_CHECK(cudaMallocHost((void**)&h_col_tile_T, dimension * max_tile_cols * sizeof(float)));
-    CUDA_CHECK(cudaMallocHost((void**)&h_tile, max_tile_rows * max_tile_cols * sizeof(float)));
+    float* d_tile[2] = {nullptr, nullptr};
+    CUDA_CHECK(cudaMalloc(&d_tile[0], max_tile_rows * max_tile_cols * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_tile[1], max_tile_rows * max_tile_cols * sizeof(float)));
 
-    // 저 위의 flat_data도 pinned해야됨? - 한번 일어나는 거면 굳이 안해도 되나? - 나중에 데이터 커지면 해야될수도
-    // 쓰기 전용 H2D 버퍼는 cudaHostAllocWriteCombined 옵션으로 H2D 성능↑ ?
+    cudaStream_t io_stream, k_stream, d2h_stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&io_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&k_stream,   cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&d2h_stream, cudaStreamNonBlocking));
 
-    cudaStream_t io_stream, compute_stream;
-    CUDA_CHECK(cudaStreamCreateWithFlags(&io_stream, cudaStreamNonBlocking)); // 업로드 전용
-    CUDA_CHECK(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking)); // kernel + d_tile to h_tile 다운로드
-
-    cudaEvent_t ev_up;
-    cudaEventCreateWithFlags(&ev_up, cudaEventDisableTiming);
+    cudaEvent_t up_evt; // H2D 완료 이벤트
+    cudaEventCreateWithFlags(&up_evt, cudaEventDisableTiming);
+    cudaEvent_t ker_done_evt[2], d2h_done_evt[2];
+    for (int b=0; b<2; ++b) {
+        cudaEventCreateWithFlags(&ker_done_evt[b],  cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&d2h_done_evt[b],  cudaEventDisableTiming);
+    }
 
     data_loading_end_time = std::chrono::high_resolution_clock::now();
     total_loading_time = data_loading_end_time - data_loading_start_time;
     std::cout << "@@@@@@@@@@@@@[Time] Data loading took " << total_loading_time.count() << " seconds.\n";
 
-// 여기서 결과 나오면 앞에는 문제 없고 이중for문부터 문제
     std::cout << "--------------------------------------------------" << std::endl;
     std::cout << "Start tile-based pairwise distance calculation..." << std::endl;
     auto tile_start_time = std::chrono::high_resolution_clock::now();
@@ -257,78 +259,63 @@ int main(int argc, char *argv[])
         size_t col_start = tile_j * tile_size;
         size_t tile_cols  = std::min(tile_size, N - col_start);
 
-        // std::vector<float> col_tile_T(dimension * tile_cols);
         for (size_t col = 0; col < tile_cols; ++col) {
             const float* src = flat_data.data() + (col_start + col) * dimension;
             for (size_t d = 0; d < dimension; ++d) {
                 h_col_tile_T[d * tile_cols + col] = src[d];
             }
         }
+
         CUDA_CHECK(cudaMemcpyAsync(d_col_tile_T, h_col_tile_T, dimension * tile_cols * sizeof(float), cudaMemcpyHostToDevice, io_stream));
-
-        // 업로드 완료 이벤트 기록
-        cudaEventRecord(ev_up, io_stream);
-        // compute_stream이 업로드 완료를 기다림
-        cudaStreamWaitEvent(compute_stream, ev_up, 0);
-
-        // float* d_col_tile_T = nullptr;
-        // cudaError_t err_colT = cudaMalloc(&d_col_tile_T, dimension * tile_cols * sizeof(float));
-        // if (err_colT != cudaSuccess) {
-        //     std::cerr << "[Error] cudaMalloc failed for d_col_tile_T: " << cudaGetErrorString(err_colT) << std::endl;
-        //     return 1;
-        // }
-        // cudaMemcpy(d_col_tile_T, col_tile_T.data(), dimension * tile_cols * sizeof(float), cudaMemcpyHostToDevice);
+        cudaEventRecord(up_evt, io_stream);
+        cudaStreamWaitEvent(k_stream, up_evt, 0);
 
         for (size_t tile_i = 0; tile_i < num_tiles; ++tile_i) {
+            int p = tile_i & 1;
+
             size_t row_start = tile_i * tile_size;
             size_t tile_rows = std::min(tile_size, N - row_start);
-
-            // float *d_tile = nullptr;
-            // size_t d_tile_bytes = tile_rows * tile_cols * sizeof(float);
-            // double d_tile_MB = (double)d_tile_bytes / (1024.0 * 1024.0);
-            // if (tile_i == 0 && tile_j == 0) {
-            //     std::cout << "[Info] d_tile allocation size: "  << d_tile_bytes << " bytes (" << std::fixed << std::setprecision(2) << d_tile_MB << " MB)" << std::endl;
-            // }
-            // cudaError_t err_d_tile = cudaMalloc(&d_tile, d_tile_bytes);
-            // if (err_d_tile != cudaSuccess) {
-            //     std::cerr << "[Error] cudaMalloc failed for d_tile: " << cudaGetErrorString(err_d_tile) << std::endl;
-            //     return 1;
-            // }
 
             dim3 block(16, 16);
             dim3 grid((tile_cols + block.x - 1) / block.x, (tile_rows + block.y - 1) / block.y);
 
-            launch_pairwise_distance_tile_kernel_transpose_stream(d_db_vectors, d_col_tile_T, d_tile, (int)N, (int)dimension, (int)row_start, (int)tile_rows, (int)tile_cols, block, grid, compute_stream); // 없으면 371 있으면 470
-            // launch_pairwise_distance_tile_kernel_transpose(d_db_vectors, d_col_tile_T, d_tile, (int)N, (int)dimension, (int)row_start, (int)tile_rows, (int)tile_cols, block, grid); // 408??? 대체 왜 ?
+            cudaStreamWaitEvent(k_stream, d2h_done_evt[p], 0);
+            launch_pairwise_distance_tile_kernel_transpose_stream(d_db_vectors, d_col_tile_T, d_tile[p], (int)N, (int)dimension, (int)row_start, (int)tile_rows, (int)tile_cols, block, grid, k_stream);
+            cudaEventRecord(ker_done_evt[p], k_stream);
 
-            CUDA_CHECK(cudaMemcpyAsync(h_tile, d_tile, tile_rows * tile_cols * sizeof(float), cudaMemcpyDeviceToHost, compute_stream));
 
-            // cudaMemcpy(h_tile.data(), d_tile, d_tile_bytes, cudaMemcpyDeviceToHost);
+            cudaStreamWaitEvent(d2h_stream, ker_done_evt[p], 0);
+            CUDA_CHECK(cudaMemcpyAsync(h_tile[p], d_tile[p], tile_rows * tile_cols * sizeof(float), cudaMemcpyDeviceToHost, d2h_stream));
+            cudaEventRecord(d2h_done_evt[p], d2h_stream);
 
             if (tile_i == (num_tiles-1) && tile_j == (num_tiles-1)) {
+                CUDA_CHECK(cudaEventSynchronize(d2h_done_evt[p]));
                 std::cout << "[Tile num_tiles-1,num_tiles-1] pairwise sample:\n";
                 for (int r = 0; r < std::min<std::size_t>(7, tile_rows); ++r) {
                     for (int c = 0; c < std::min<std::size_t>(7, tile_cols); ++c)
-                        std::cout << h_tile[r * tile_cols + c] << " ";
-                        // load to cpu or disk
+                        std::cout << h_tile[p][r * tile_cols + c] << " ";
                     std::cout << std::endl;
                 }
             }
-            // cudaFree(d_tile);
         }
-        // cudaFree(d_col_tile_T);
     }
     CUDA_CHECK(cudaStreamSynchronize(io_stream));
-    CUDA_CHECK(cudaStreamSynchronize(compute_stream));
-
+    CUDA_CHECK(cudaStreamSynchronize(k_stream));
+    CUDA_CHECK(cudaStreamSynchronize(d2h_stream));
+    
     CUDA_CHECK(cudaFree(d_col_tile_T));
-    CUDA_CHECK(cudaFree(d_tile));
+    // CUDA_CHECK(cudaFree(d_tile));
     CUDA_CHECK(cudaFreeHost(h_col_tile_T));
-    CUDA_CHECK(cudaFreeHost(h_tile));
+    // CUDA_CHECK(cudaFreeHost(h_tile));
+    for (int p = 0; p < 2; ++p) {
+        CUDA_CHECK(cudaFreeHost(h_tile[p]));
+        CUDA_CHECK(cudaFree(d_tile[p]));
+    }
 
-    cudaEventDestroy(ev_up);
+    cudaEventDestroy(up_evt);
     cudaStreamDestroy(io_stream);
-    cudaStreamDestroy(compute_stream);
+    cudaStreamDestroy(k_stream);
+    cudaStreamDestroy(d2h_stream);
     
     auto tile_end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed_tile = tile_end_time - tile_start_time;

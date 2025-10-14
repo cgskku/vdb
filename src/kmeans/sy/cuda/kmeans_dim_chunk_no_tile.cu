@@ -35,30 +35,63 @@ __global__ void kmeans_labeling_kernel(
     // @@
     const float* curPointFull = &d_samples[globalThreadIndex * DIM];
 
-    // Loop through DIM chunks
-    for (int offset = 0; offset < DIM; offset += chunkSize) 
-    {
-        int curChunkSize = min(chunkSize, DIM - offset); 
+    // no tiling
+    for (int k = 0; k < K; ++k) {
+        float totalDistance = 0.0f;
 
-        // Load centroids into shared memory for this chunk
-        for (int i = tid; i < K * curChunkSize; i += blockDim.x) 
+        for (int offset = 0; offset < DIM; offset += chunkSize) 
         {
-            int c = i / curChunkSize;    
-            int d = i % curChunkSize;       
-            sharedCentroids[c * curChunkSize + d] = d_clusterCenters[c * DIM + offset + d];
-        }
-        __syncthreads(); // Ensure all centroids are loaded
+            const int curChunkSize = min(chunkSize, DIM - offset);
+            int i4 = (tid << 2);
+            const float* centBase = &d_clusterCenters[k * DIM + offset];
+            for (int idx = i4; idx < curChunkSize; idx += (blockDim.x << 2)) 
+            {
+                if (idx + 3 < curChunkSize) 
+                {
+                    float4 v = reinterpret_cast<const float4*>(centBase)[idx >> 2];
+                    reinterpret_cast<float4*>(sharedCentroids)[idx >> 2] = v;
+                } 
+                else 
+                {
+                    for (int t = 0; t < 4 && idx + t < curChunkSize; ++t) sharedCentroids[idx + t] = centBase[idx + t];
+                }
+            }
+            __syncthreads();
 
-        const float* curPoint = &d_samples[globalThreadIndex * DIM];
-        for (int k = 0; k < K; ++k) {
-            const float* partialCentroid = &sharedCentroids[k * curChunkSize];
-            float squaredDistance = get_chunk_distance(curPoint, partialCentroid, curChunkSize, offset);
-            if (squaredDistance < minDistance) {
-                minDistance = squaredDistance;
-                closestCenterIndex = k;
+            const float* curPoint = curPointFull + offset;
+            float partial = 0.0f;
+
+            int d4 = (curChunkSize & ~3);
+            for (int j = 0; j < d4; j += 4) 
+            {
+                float4 p = reinterpret_cast<const float4*>(curPoint)[j >> 2];
+                float4 c = reinterpret_cast<const float4*>(sharedCentroids)[j >> 2];
+                float dx0 = p.x - c.x; partial += dx0 * dx0;
+                float dx1 = p.y - c.y; partial += dx1 * dx1;
+                float dx2 = p.z - c.z; partial += dx2 * dx2;
+                float dx3 = p.w - c.w; partial += dx3 * dx3;
+            }
+            for (int j = d4; j < curChunkSize; ++j) 
+            {
+                float diff = curPoint[j] - sharedCentroids[j];
+                partial += diff * diff;
+            }
+
+            totalDistance += partial;
+            __syncthreads(); 
+
+            if (totalDistance >= minDistance) 
+            {
+                for (; offset + chunkSize < DIM; offset += chunkSize) {}
+                break;
             }
         }
-        __syncthreads();
+
+        if (totalDistance < minDistance) 
+        {
+            minDistance = totalDistance;
+            closestCenterIndex = k;
+        }
     }
 
     d_clusterIndices[globalThreadIndex] = closestCenterIndex;
@@ -80,25 +113,24 @@ __global__ void kmeans_update_centers_kernel(
     for (int offset = 0; offset < DIM; offset += chunkSize) {
         int curChunkSize = min(chunkSize, DIM - offset);
 
-        for(int i = tid; i < K * curChunkSize; i += blockDim.x) {
-            sharedPsum[i] = 0.0f;
-        }
+        for(int i = tid; i < K * curChunkSize; i += blockDim.x) sharedPsum[i] = 0.0f;
         __syncthreads();
 
-        if (globalThreadIndex < N) {
+        if (globalThreadIndex < N) 
+        {
             int cluster_id = d_clusterIndices[globalThreadIndex];
             const float* curPoint = &d_samples[globalThreadIndex * DIM + offset];
-            for (int d = 0; d < curChunkSize; ++d) {
-                atomicAdd(&sharedPsum[cluster_id * curChunkSize + d], curPoint[d]);
-            }
+            for (int d = 0; d < curChunkSize; ++d) atomicAdd(&sharedPsum[cluster_id * curChunkSize + d], curPoint[d]);
         }
         __syncthreads();
 
-        for (int i = tid; i < K * curChunkSize; i += blockDim.x) {
+        for (int i = tid; i < K * curChunkSize; i += blockDim.x) 
+        {
             int c = i / curChunkSize;       
             int d = i % curChunkSize;      
             atomicAdd(&d_clusterCenters[c * DIM + offset + d], sharedPsum[i]);
         }
+        __syncthreads(); 
     }
 
     if (globalThreadIndex < N) {
@@ -123,7 +155,7 @@ void launch_kmeans_labeling_chunk(
     float* d_clusterCenters, 
     int N, int TPB, int K, int DIM, int chunkSize) 
 {
-    int shared_memory_size = K * chunkSize * sizeof(float); // Use chunkSize from host
+    int shared_memory_size = chunkSize * sizeof(float); // Use chunkSize from host
 
     dim3 block(TPB);
     dim3 grid((N + TPB - 1) / TPB);

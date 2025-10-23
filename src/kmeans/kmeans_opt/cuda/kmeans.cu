@@ -251,3 +251,107 @@ void launch_kmeans_update_center_tile(float *d_samples, int *d_clusterIndices, f
     kmeans_update_centers_tile_kernel<<<(actual_tile_size + TPB - 1) / TPB, TPB>>>(
         d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, K, DIM, tile_start, actual_tile_size);
 }
+// corner turning (transpose) kernels
+
+__global__ void transpose_centers_kernel(float *d_centroids, float *d_centroids_T, int K, int DIM)
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    int d = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (k < K && d < DIM) {
+        d_centroids_T[d * K + k] = d_centroids[k * DIM + d];
+    }
+}
+
+__global__ void kmeans_labeling_corner_turning_kernel(float *d_samples, int *d_clusterIndices, 
+                                                     float *d_centroids_T, int N, int K, int DIM)
+{
+    const int globalThreadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (globalThreadIndex >= N) return;
+
+    float minDistance = INFINITY;
+    int closestCenterIndex = -1;
+
+    const float* curPoint = &d_samples[globalThreadIndex * DIM];
+
+    // Process centroids with corner turning (transposed layout)
+    for (int k = 0; k < K; ++k)
+    {
+        float distance = 0.0f;
+        for (int d = 0; d < DIM; ++d)
+        {
+            float vecDiff = curPoint[d] - d_centroids_T[d * K + k];
+            distance += vecDiff * vecDiff;
+        }
+        distance = sqrtf(distance);
+        
+        if (distance < minDistance)
+        {
+            minDistance = distance;
+            closestCenterIndex = k;
+        }
+    }
+
+    d_clusterIndices[globalThreadIndex] = closestCenterIndex;
+}
+
+__global__ void kmeans_labeling_corner_turning_tile_kernel(float *d_samples, int *d_clusterIndices, 
+                                                          float *d_centroids_T, int N, int K, int DIM, 
+                                                          int tile_start, int tile_size)
+{
+    const int globalThreadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    const int localIndex = tile_start + globalThreadIndex;
+    
+    if (localIndex >= N || globalThreadIndex >= tile_size) return;
+
+    float minDistance = INFINITY;
+    int closestCenterIndex = -1;
+
+    const float* curPoint = &d_samples[localIndex * DIM];
+
+    // Process centroids with corner turning (transposed layout)
+    for (int k = 0; k < K; ++k)
+    {
+        float distance = 0.0f;
+        for (int d = 0; d < DIM; ++d)
+        {
+            float vecDiff = curPoint[d] - d_centroids_T[d * K + k];
+            distance += vecDiff * vecDiff;
+        }
+        distance = sqrtf(distance);
+        
+        if (distance < minDistance)
+        {
+            minDistance = distance;
+            closestCenterIndex = k;
+        }
+    }
+
+    d_clusterIndices[localIndex] = closestCenterIndex;
+}
+
+// Corner turning functions
+void transpose_centers(float *d_centroids, float *d_centroids_T, int K, int DIM, int TPB)
+{
+    dim3 block(16, 16);
+    dim3 grid((K + block.x - 1) / block.x, (DIM + block.y - 1) / block.y);
+    transpose_centers_kernel<<<grid, block>>>(d_centroids, d_centroids_T, K, DIM);
+}
+
+void launch_kmeans_labeling_corner_turning(float *d_samples, int *d_clusterIndices, 
+                                          float *d_centroids_T, int N, int TPB, int K, int DIM)
+{
+    kmeans_labeling_corner_turning_kernel<<<(N + TPB - 1) / TPB, TPB>>>(
+        d_samples, d_clusterIndices, d_centroids_T, N, K, DIM);
+}
+
+void launch_kmeans_labeling_corner_turning_tile(float *d_samples, int *d_clusterIndices, 
+                                               float *d_centroids_T, int N, int TPB, int K, int DIM, 
+                                               int tile_start, int tile_size)
+{
+    int actual_tile_size = min(tile_size, N - tile_start);
+    if (actual_tile_size <= 0) return;
+    
+    kmeans_labeling_corner_turning_tile_kernel<<<(actual_tile_size + TPB - 1) / TPB, TPB>>>(
+        d_samples, d_clusterIndices, d_centroids_T, N, K, DIM, tile_start, actual_tile_size);
+}

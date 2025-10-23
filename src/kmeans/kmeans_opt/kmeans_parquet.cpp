@@ -115,11 +115,11 @@ double compute_SSE(const std::vector<float>& data, const std::vector<float>& cen
 
 int main(int argc, char* argv[]) 
 {
-    // ./kmeans_multi <parquet1> <parquet2> <TPB> <K> <MAX_ITER> <use_tiling> <tile_size>
+    // ./kmeans_multi <parquet1> <parquet2> <TPB> <K> <MAX_ITER>
     if (argc != 6) 
     {
         std::cerr << "Usage: " << argv[0]
-                  << " <Parquet file 1> <Parquet file 2> <Threads per block> <K> <Max iterations> <use_tiling> <tile_size>\n";
+                  << " <Parquet file 1> <Parquet file 2> <Threads per block> <K> <Max iterations>\n";
         return EXIT_FAILURE;
     }
 
@@ -128,12 +128,15 @@ int main(int argc, char* argv[])
     const int TPB           = std::atoi(argv[3]);
     const std::size_t K     = static_cast<std::size_t>(std::atoll(argv[4]));
     const int MAX_ITER      = std::atoi(argv[5]);
+    const bool use_corner_turning = 1;
     const bool use_tiling   = 1;
     const int tile_size     = 10000;
 
     std::cout << "=== K-means Configuration ===" << std::endl;
     std::cout << "Tiling: " << (use_tiling ? "ON" : "OFF") << std::endl;
-    if (use_tiling) {
+    std::cout << "Corner turning: " << (use_corner_turning ? "ON" : "OFF") << std::endl;
+    if (use_tiling) 
+    {
         std::cout << "Tile size: " << tile_size << std::endl;
     }
     std::cout << "=============================" << std::endl;
@@ -159,6 +162,22 @@ int main(int argc, char* argv[])
     cudaMalloc(&d_centroids,  K * D * sizeof(float));
     cudaMalloc(&d_assign,     N * sizeof(int));
     cudaMalloc(&d_sizes,      K * sizeof(int));
+
+    // Pinned memory for faster CPU-GPU transfers (minimal usage)
+    int* h_assign_pinned = nullptr;
+    float* h_centroids_pinned = nullptr;
+    cudaMallocHost(&h_assign_pinned, N * sizeof(int));
+    cudaMallocHost(&h_centroids_pinned, K * D * sizeof(float));
+    
+    // Corner turning: transpose centroids for better memory access
+    float* d_centroids_T = nullptr;
+    if (use_corner_turning) 
+    {
+        cudaMalloc(&d_centroids_T, K * D * sizeof(float));
+        std::cout << "[MEMORY] Using corner turning with transposed centroids" << std::endl;
+    }
+    
+    std::cout << "[MEMORY] Using minimal pinned memory for result transfers" << std::endl;
 
     cudaMemset(d_assign, -1, N * sizeof(int));
     cudaMemset(d_sizes,   0, K * sizeof(int));
@@ -194,10 +213,26 @@ int main(int argc, char* argv[])
             int num_tiles = (N + tile_size - 1) / tile_size;
             
             // Phase 1: Labeling (process each tile)
-            for (int tile = 0; tile < num_tiles; ++tile) 
+            if (use_corner_turning) 
             {
-                int tile_start = tile * tile_size;
-                launch_kmeans_labeling_tile(d_datapoints, d_assign, d_centroids, N, TPB, K, D, tile_start, tile_size);
+                // Transpose centroids for corner turning
+                transpose_centers(d_centroids, d_centroids_T, K, D, TPB);
+                cudaDeviceSynchronize();
+                
+                // Corner turning with tiling
+                for (int tile = 0; tile < num_tiles; ++tile) 
+                {
+                    int tile_start = tile * tile_size;
+                    launch_kmeans_labeling_corner_turning_tile(d_datapoints, d_assign, d_centroids_T, N, TPB, K, D, tile_start, tile_size);
+                }
+            } else 
+            {
+                // Standard tiling approach
+                for (int tile = 0; tile < num_tiles; ++tile) 
+                {
+                    int tile_start = tile * tile_size;
+                    launch_kmeans_labeling_tile(d_datapoints, d_assign, d_centroids, N, TPB, K, D, tile_start, tile_size);
+                }
             }
             cudaDeviceSynchronize();
 
@@ -224,8 +259,13 @@ int main(int argc, char* argv[])
             cudaDeviceSynchronize();
         }
 
-        cudaMemcpy(h_assign.data(),   d_assign,    N * sizeof(int),      cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_centroids.data(), d_centroids, K * D * sizeof(float), cudaMemcpyDeviceToHost);
+        // Copy from GPU to pinned memory (faster transfer)
+        cudaMemcpy(h_assign_pinned,   d_assign,    N * sizeof(int),      cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_centroids_pinned, d_centroids, K * D * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        // Copy from pinned memory to regular host memory
+        memcpy(h_assign.data(), h_assign_pinned, N * sizeof(int));
+        memcpy(h_centroids.data(), h_centroids_pinned, K * D * sizeof(float));
 
         const double sse = compute_SSE(data, h_centroids, h_assign, N, K, D);
         
@@ -301,6 +341,8 @@ int main(int argc, char* argv[])
     }
     std::cout << "Optimization features used:" << std::endl;
     std::cout << "  - Tiling: " << (use_tiling ? "ON" : "OFF") << std::endl;
+    std::cout << "  - Corner turning: " << (use_corner_turning ? "ON" : "OFF") << std::endl;
+    std::cout << "  - Pinned memory: ON (minimal usage)" << std::endl;
     if (use_tiling) {
         std::cout << "  - Tile size: " << tile_size << std::endl;
         int num_tiles = (N + tile_size - 1) / tile_size;
@@ -338,5 +380,14 @@ int main(int argc, char* argv[])
     cudaFree(d_centroids);
     cudaFree(d_assign);
     cudaFree(d_sizes);
+    
+    // free corner turning memory
+    if (use_corner_turning) {
+        cudaFree(d_centroids_T);
+    }
+    
+    // free pinned memory
+    cudaFreeHost(h_assign_pinned);
+    cudaFreeHost(h_centroids_pinned);
     return 0;
 }

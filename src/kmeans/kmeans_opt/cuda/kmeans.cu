@@ -258,7 +258,8 @@ __global__ void transpose_centers_kernel(float *d_centroids, float *d_centroids_
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     int d = blockIdx.y * blockDim.y + threadIdx.y;
     
-    if (k < K && d < DIM) {
+    if (k < K && d < DIM) 
+    {
         d_centroids_T[d * K + k] = d_centroids[k * DIM + d];
     }
 }
@@ -291,7 +292,6 @@ __global__ void kmeans_labeling_corner_turning_kernel(float *d_samples, int *d_c
             closestCenterIndex = k;
         }
     }
-
     d_clusterIndices[globalThreadIndex] = closestCenterIndex;
 }
 
@@ -354,4 +354,50 @@ void launch_kmeans_labeling_corner_turning_tile(float *d_samples, int *d_cluster
     
     kmeans_labeling_corner_turning_tile_kernel<<<(actual_tile_size + TPB - 1) / TPB, TPB>>>(
         d_samples, d_clusterIndices, d_centroids_T, N, K, DIM, tile_start, actual_tile_size);
+}
+
+// stream-based functions
+
+void launch_kmeans_labeling_corner_turning_tile_stream(float *d_samples, int *d_clusterIndices, 
+                                                      float *d_centroids_T, int N, int TPB, int K, int DIM, 
+                                                      int tile_start, int tile_size, cudaStream_t stream)
+{
+    int actual_tile_size = min(tile_size, N - tile_start);
+    if (actual_tile_size <= 0) return;
+    
+    kmeans_labeling_corner_turning_tile_kernel<<<(actual_tile_size + TPB - 1) / TPB, TPB, 0, stream>>>(
+        d_samples, d_clusterIndices, d_centroids_T, N, K, DIM, tile_start, actual_tile_size);
+}
+
+void launch_kmeans_labeling_tile_stream(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, 
+                                       int N, int TPB, int K, int DIM, int tile_start, int tile_size, cudaStream_t stream)
+{
+    int actual_tile_size = min(tile_size, N - tile_start);
+    if (actual_tile_size <= 0) return;
+    
+    kmeans_labeling_tile_kernel<<<(actual_tile_size + TPB - 1) / TPB, TPB, 0, stream>>>(
+        d_samples, d_clusterIndices, d_clusterCenters, N, K, DIM, tile_start, actual_tile_size);
+}
+
+void launch_kmeans_update_center_tile_stream(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, 
+                                            int *d_clusterSizes, int N, int TPB, int K, int DIM, 
+                                            int tile_start, int tile_size, cudaStream_t stream)
+{
+    int actual_tile_size = min(tile_size, N - tile_start);
+    if (actual_tile_size <= 0) return;
+    
+    kmeans_update_centers_tile_kernel<<<(actual_tile_size + TPB - 1) / TPB, TPB, 0, stream>>>(
+        d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, K, DIM, tile_start, actual_tile_size);
+}
+
+void launch_kmeans_average_centers_stream(float *d_clusterCenters, int *d_clusterSizes, int K, int DIM, int TPB, cudaStream_t stream)
+{
+    kmeans_average_centers_kernel<<<(K + TPB - 1) / TPB, TPB, 0, stream>>>(d_clusterCenters, d_clusterSizes, K, DIM);
+}
+
+void transpose_centers_stream(float *d_centroids, float *d_centroids_T, int K, int DIM, int TPB, cudaStream_t stream)
+{
+    dim3 block(16, 16);
+    dim3 grid((K + block.x - 1) / block.x, (DIM + block.y - 1) / block.y);
+    transpose_centers_kernel<<<grid, block, 0, stream>>>(d_centroids, d_centroids_T, K, DIM);
 }

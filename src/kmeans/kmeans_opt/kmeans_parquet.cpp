@@ -128,6 +128,7 @@ int main(int argc, char* argv[])
     const int TPB           = std::atoi(argv[3]);
     const std::size_t K     = static_cast<std::size_t>(std::atoll(argv[4]));
     const int MAX_ITER      = std::atoi(argv[5]);
+    const bool use_streams  = 1;
     const bool use_corner_turning = 1;
     const bool use_tiling   = 1;
     const int tile_size     = 10000;
@@ -135,6 +136,7 @@ int main(int argc, char* argv[])
     std::cout << "=== K-means Configuration ===" << std::endl;
     std::cout << "Tiling: " << (use_tiling ? "ON" : "OFF") << std::endl;
     std::cout << "Corner turning: " << (use_corner_turning ? "ON" : "OFF") << std::endl;
+    std::cout << "Streams: " << (use_streams ? "ON" : "OFF") << std::endl;
     if (use_tiling) 
     {
         std::cout << "Tile size: " << tile_size << std::endl;
@@ -176,6 +178,21 @@ int main(int argc, char* argv[])
         cudaMalloc(&d_centroids_T, K * D * sizeof(float));
         std::cout << "[MEMORY] Using corner turning with transposed centroids" << std::endl;
     }
+
+    // Streams for asynchronous processing
+    cudaStream_t* streams = nullptr;
+    int num_streams = 0;
+    if (use_streams) 
+    {
+        int num_tiles = (N + tile_size - 1) / tile_size;
+        num_streams = std::min(4, num_tiles); // Use up to 4 streams
+        streams = new cudaStream_t[num_streams];
+        for (int i = 0; i < num_streams; ++i) 
+        {
+            cudaStreamCreate(&streams[i]);
+        }
+        std::cout << "[STREAMS] Created " << num_streams << " CUDA streams for asynchronous processing" << std::endl;
+    }
     
     std::cout << "[MEMORY] Using minimal pinned memory for result transfers" << std::endl;
 
@@ -212,45 +229,111 @@ int main(int argc, char* argv[])
             // Tile-based processing (load-manager style)
             int num_tiles = (N + tile_size - 1) / tile_size;
             
-            // Phase 1: Labeling (process each tile)
+            // Labeling (process each tile)
             if (use_corner_turning) 
             {
                 // Transpose centroids for corner turning
-                transpose_centers(d_centroids, d_centroids_T, K, D, TPB);
+                if (use_streams)    transpose_centers_stream(d_centroids, d_centroids_T, K, D, TPB, streams[0]);
+                else                transpose_centers(d_centroids, d_centroids_T, K, D, TPB);
                 cudaDeviceSynchronize();
                 
                 // Corner turning with tiling
-                for (int tile = 0; tile < num_tiles; ++tile) 
+                if (use_streams) 
                 {
-                    int tile_start = tile * tile_size;
-                    launch_kmeans_labeling_corner_turning_tile(d_datapoints, d_assign, d_centroids_T, N, TPB, K, D, tile_start, tile_size);
-                }
-            } else 
-            {
-                // Standard tiling approach
-                for (int tile = 0; tile < num_tiles; ++tile) 
+                    // Process tiles in parallel using streams
+                    for (int tile = 0; tile < num_tiles; ++tile) 
+                    {
+                        int tile_start = tile * tile_size;
+                        int stream_id = tile % num_streams;
+                        launch_kmeans_labeling_corner_turning_tile_stream(d_datapoints, d_assign, d_centroids_T, N, TPB, K, D, tile_start, tile_size, streams[stream_id]);
+                    }
+                    // Wait for all streams to complete
+                    for (int i = 0; i < num_streams; ++i) 
+                    {
+                        cudaStreamSynchronize(streams[i]);
+                    }
+                } 
+                else 
                 {
-                    int tile_start = tile * tile_size;
-                    launch_kmeans_labeling_tile(d_datapoints, d_assign, d_centroids, N, TPB, K, D, tile_start, tile_size);
+                    // Sequential processing
+                    for (int tile = 0; tile < num_tiles; ++tile) 
+                    {
+                        int tile_start = tile * tile_size;
+                        launch_kmeans_labeling_corner_turning_tile(d_datapoints, d_assign, d_centroids_T, N, TPB, K, D, tile_start, tile_size);
+                    }
+                    cudaDeviceSynchronize();
                 }
             }
-            cudaDeviceSynchronize();
+            else 
+            {
+                // Standard tiling approach
+                if (use_streams) 
+                {
+                    // Process tiles in parallel using streams
+                    for (int tile = 0; tile < num_tiles; ++tile) 
+                    {
+                        int tile_start = tile * tile_size;
+                        int stream_id = tile % num_streams;
+                        launch_kmeans_labeling_tile_stream(d_datapoints, d_assign, d_centroids, N, TPB, K, D, tile_start, tile_size, streams[stream_id]);
+                    }
+                    // Wait for all streams to complete
+                    for (int i = 0; i < num_streams; ++i) 
+                    {
+                        cudaStreamSynchronize(streams[i]);
+                    }
+                } else 
+                {
+                    // Sequential processing
+                    for (int tile = 0; tile < num_tiles; ++tile) 
+                    {
+                        int tile_start = tile * tile_size;
+                        launch_kmeans_labeling_tile(d_datapoints, d_assign, d_centroids, N, TPB, K, D, tile_start, tile_size);
+                    }
+                    cudaDeviceSynchronize();
+                }
+            }
 
-            // Phase 2: Update centers (reset and accumulate)
+            // Update centers (reset and accumulate)
             cudaMemset(d_centroids, 0, K * D * sizeof(float));
             cudaMemset(d_sizes, 0, K * sizeof(int));
             
-            for (int tile = 0; tile < num_tiles; ++tile) 
+            if (use_streams) 
             {
-                int tile_start = tile * tile_size;
-                launch_kmeans_update_center_tile(d_datapoints, d_assign, d_centroids, d_sizes, N, TPB, K, D, tile_start, tile_size);
+                // Process tiles in parallel using streams
+                for (int tile = 0; tile < num_tiles; ++tile) 
+                {
+                    int tile_start = tile * tile_size;
+                    int stream_id = tile % num_streams;
+                    launch_kmeans_update_center_tile_stream(d_datapoints, d_assign, d_centroids, d_sizes, N, TPB, K, D, tile_start, tile_size, streams[stream_id]);
+                }
+                // Wait for all streams to complete
+                for (int i = 0; i < num_streams; ++i) 
+                {
+                    cudaStreamSynchronize(streams[i]);
+                }
+            } 
+            else 
+            {
+                // Sequential processing
+                for (int tile = 0; tile < num_tiles; ++tile) 
+                {
+                    int tile_start = tile * tile_size;
+                    launch_kmeans_update_center_tile(d_datapoints, d_assign, d_centroids, d_sizes, N, TPB, K, D, tile_start, tile_size);
+                }
+                cudaDeviceSynchronize();
             }
-            cudaDeviceSynchronize();
-            
-            // Phase 3: Average centers
-            launch_kmeans_average_centers(d_centroids, d_sizes, K, D, TPB);
-            cudaDeviceSynchronize();
-        } else {
+
+            // Average centers
+            if (use_streams) {
+                launch_kmeans_average_centers_stream(d_centroids, d_sizes, K, D, TPB, streams[0]);
+                cudaStreamSynchronize(streams[0]);
+            } else {
+                launch_kmeans_average_centers(d_centroids, d_sizes, K, D, TPB);
+                cudaDeviceSynchronize();
+            }
+        } 
+        else 
+        {
             // Standard processing
             launch_kmeans_labeling(d_datapoints, d_assign, d_centroids, N, TPB, K, D);
             cudaDeviceSynchronize();
@@ -269,7 +352,7 @@ int main(int argc, char* argv[])
 
         const double sse = compute_SSE(data, h_centroids, h_assign, N, K, D);
         
-        // Frobenius norm 기반 수렴 검사 (첫 번째 반복 제외)
+        // Frobenius norm based convergence check (excluding first iteration)
         if (it > 1) 
         {
             // Frobenius norm of the difference in cluster centers
@@ -299,7 +382,7 @@ int main(int argc, char* argv[])
             // Relative tolerance check (scikit-learn style)
             double relative_change = (frobenius_norm_prev > 0) ? (frobenius_norm_diff / frobenius_norm_prev) : 0.0;
             
-            // 조기 종료 조건 확인: 상대적 허용 오차 미만시 종료
+            // early stopping condition check
             if (relative_change < tol) 
             {
                 std::cout << "Iteration " << it << ": SSE = " << std::fixed << std::setprecision(3) << sse 
@@ -316,8 +399,6 @@ int main(int argc, char* argv[])
         {
             std::cout << "Iteration " << it << ": SSE = " << std::fixed << std::setprecision(3) << sse << std::endl;
         }
-        
-        // 현재 센트로이드를 이전 센트로이드로 저장
         prev_centroids = h_centroids;
     }
     
@@ -329,7 +410,6 @@ int main(int argc, char* argv[])
     auto t_km_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> km_elapsed = t_km_end - t_km_start;
     
-    // 최종 요약 출력
     std::cout << "\n=== K-means Execution Summary ===" << std::endl;
     std::cout << "Final iteration: " << final_iteration << " / " << MAX_ITER << std::endl;
     std::cout << "Convergence status: " << (converged ? "CONVERGED" : "NOT CONVERGED") << std::endl;
@@ -343,6 +423,10 @@ int main(int argc, char* argv[])
     std::cout << "  - Tiling: " << (use_tiling ? "ON" : "OFF") << std::endl;
     std::cout << "  - Corner turning: " << (use_corner_turning ? "ON" : "OFF") << std::endl;
     std::cout << "  - Pinned memory: ON (minimal usage)" << std::endl;
+    std::cout << "  - Streams: " << (use_streams ? "ON" : "OFF") << std::endl;
+    if (use_streams) {
+        std::cout << "  - Number of streams: " << num_streams << std::endl;
+    }
     if (use_tiling) {
         std::cout << "  - Tile size: " << tile_size << std::endl;
         int num_tiles = (N + tile_size - 1) / tile_size;
@@ -382,8 +466,13 @@ int main(int argc, char* argv[])
     cudaFree(d_sizes);
     
     // free corner turning memory
-    if (use_corner_turning) {
-        cudaFree(d_centroids_T);
+    if (use_corner_turning) cudaFree(d_centroids_T);
+
+    // free streams
+    if (use_streams) 
+    {
+        for (int i = 0; i < num_streams; ++i) cudaStreamDestroy(streams[i]);
+        delete[] streams;
     }
     
     // free pinned memory

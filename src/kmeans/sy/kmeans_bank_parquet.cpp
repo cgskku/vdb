@@ -182,9 +182,21 @@ int main(int argc, char *argv[])
     for (int it = 1; it <= MAX_ITER; ++it) 
     {
         launch_kmeans_labeling(d_datapoints, d_assign, d_centroids, d_sizes, N, TPB, K, D);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) 
+        {
+            std::cerr << "Error after launch_kmeans_labeling: " << cudaGetErrorString(err) << std::endl;
+            return 1;
+        }
         cudaDeviceSynchronize();
 
         launch_kmeans_update_center(d_datapoints, d_assign, d_centroids, d_sizes, N, TPB, K, D);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) 
+        {
+            std::cerr << "Error after launch_kmeans_update_center: " << cudaGetErrorString(err) << std::endl;
+            return 1;
+        }
         cudaDeviceSynchronize();
 
         cudaMemcpy(h_assign.data(),   d_assign,    N * sizeof(int),      cudaMemcpyDeviceToHost);
@@ -271,8 +283,8 @@ int main(int argc, char *argv[])
     for (std::size_t k = 0; k < K; ++k) 
     {
         File << "Centroid " << k << ": ";
-        for (std::size_t d = 0; d < dimension; ++d) {
-            File << h_clusterCenters[k * dimension + d] << " ";
+        for (std::size_t d = 0; d < D; ++d) {
+            File << h_centroids[k * D + d] << " ";
         }
         File << "\n";
     }
@@ -281,10 +293,10 @@ int main(int argc, char *argv[])
     for (std::size_t i = 0; i < N; ++i) 
     {
         File << "Data Point " << i << ": ";
-        for (std::size_t d = 0; d < dimension; ++d) {
-            File << h_samples[i * dimension + d] << " ";
+        for (std::size_t d = 0; d < D; ++d) {
+            File << data[i * D + d] << " ";
         }
-        File << " -> Cluster " << h_clusterIndices[i] << "\n";
+        File << " -> Cluster " << h_assign[i] << "\n";
     }
     File.close();
 #endif

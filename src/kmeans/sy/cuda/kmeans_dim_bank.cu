@@ -17,60 +17,42 @@ __global__ void kmeans_labeling_kernel(
 
     extern __shared__ float sharedMemory[];
     float *squaredDistanceMem = &sharedMemory[0];
-    //int maxWarp = sharedMemSize / sizeof(float) / WARPSIZE;
     int partialDim = DIM / WARPSIZE;
-    //int offsetDim = DIM % WARPSIZE;
     int distanceSize = (partialDim + 1) * WARPSIZE;
-    float *sharedCentroids = &sharedMemory[distanceSize+2]; // @@ fix
-    // float *sharedCentroids = &sharedMemory[distanceSize]; // @@ fix before
-    //const int globalThreadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    float *sharedCentroids = &sharedMemory[distanceSize];
 
     const int tid = threadIdx.x;
-    if(tid == 0) squaredDistanceMem[distanceSize] = INFINITY;
-    __syncthreads();
-    int *cluster_id = (int *)&squaredDistanceMem[distanceSize + 1];
+    squaredDistanceMem[DIM] = INFINITY;
+    int *cluster_id = (int *)&squaredDistanceMem[DIM + 1];
 
-    int headBytes = (distanceSize + 2) * (int)sizeof(float); // @@ add
-    int maxCentroidSapce = sharedMemSize - headBytes; // @@ add
-    int maxk = maxCentroidSapce / (DIM * (int)sizeof(float));
-    // int maxk = maxCentroidSapce / DIM / sizeof(float); // @@ fix before
-    if (maxk <= 0) return;
-
+    int maxCentroidSapce = sharedMemSize - (distanceSize * sizeof(float));
+    int maxk = maxCentroidSapce / DIM / sizeof(float);
     int k = maxk;
-    for (int o = 0; o < K; o += k)
+    for(int o=0; o<K; o+=k)
     {
-        k = min(maxk, K - o);
+        k = min(maxk, K-o);
 
-        // load centroids to shared memory
-        for (int j = tid; j < k * DIM; j += blockDim.x)
+        for(int j=tid; j<k*DIM; j+=blockDim.x)
         {
-            sharedCentroids[j] = d_clusterCenters[o * (size_t)DIM + j];
+            sharedCentroids[j] = d_clusterCenters[o * DIM + j];
         }
         __syncthreads();
 
-        // calculate distance between data point and centroids
-        for (int j = 0; j < k; j++)
+        for(int j=0; j<k; j++)
         {
-            for (int i = tid; i < distanceSize; i += blockDim.x)
+            for(int i=tid; i<DIM; i+=blockDim.x)
             {
-                float v = 0.f;
-                if(i < DIM)
-                {
-                    float dataPoint = d_samples[blockIdx.x * DIM + i];
-                    float kPoint = sharedCentroids[j * DIM + i];
-                    float diff = dataPoint - kPoint;
-                    v = diff * diff;
-                }
-                squaredDistanceMem[i] = v;
+                float dataPoint = d_samples[blockIdx.x * DIM + i];
+                float kPoint = sharedCentroids[j * DIM + i];
+                float diff = dataPoint - kPoint;
+                squaredDistanceMem[i] = diff * diff;
             }
-            __syncthreads();
 
-            // reduce distance
-            for (int stride = distanceSize / 2; stride > 0; stride >>= 1)
+            for( int stride = distanceSize/2; stride>0; stride/=2)
             {
-                for (int i = tid; i < stride; i+= blockDim.x)
+                for(int i=tid; i<stride; i+=blockDim.x)
                 {
-                    if (i + stride < distanceSize)
+                    if (i+stride<DIM)
                     {
                         squaredDistanceMem[i] += squaredDistanceMem[i + stride];
                     }
@@ -78,46 +60,24 @@ __global__ void kmeans_labeling_kernel(
                 __syncthreads();
             }
 
-            if (tid == 0)
+            if(tid==0)
             {
-                // @@ fix bug
-                float current_distance = squaredDistanceMem[0];
-                float min_distance = squaredDistanceMem[distanceSize];
-
-                if (min_distance > current_distance)
+                if (squaredDistanceMem[DIM] > squaredDistanceMem[tid])
                 {
-                    squaredDistanceMem[distanceSize] = current_distance;
+                    squaredDistanceMem[DIM] = squaredDistanceMem[tid];
                     *cluster_id = o + j;
-                    //d_clusterIndices[blockIdx.x] = o + j;
                 }
-                __syncthreads();
             }
         }
     }
 
-    if (tid == 0)
+    if(tid==0)
     {
         atomicAdd(&d_clusterSizes[*cluster_id], 1);
         d_clusterIndices[blockIdx.x] = *cluster_id;
     }
 }
 
-// __global__ void kmeans_update_centers_kernel(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, int *d_clusterSizes, int N, int K, int DIM)
-// {
-//     const int globalThreadIndex = blockIdx.x * blockDim.x + threadIdx.x;
-//     if (globalThreadIndex >= N) return;
-
-//     int cluster_id = d_clusterIndices[globalThreadIndex];
-
-//     // Accumulate the coordinates of each data point to the cluster centroid it belongs to
-//     for (int d = 0; d < DIM; ++d)
-//     {
-//         atomicAdd(&d_clusterCenters[cluster_id * DIM + d], d_samples[globalThreadIndex * DIM + d]);
-//     }
-
-//     // Increase the count of data points included in the cluster the current data point belongs to by 1
-//     atomicAdd(&d_clusterSizes[cluster_id], 1);
-// }
 
 __global__ void kmeans_update_centers_kernel(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, int *d_clusterSizes, int N, int K, int DIM)
 {
@@ -164,24 +124,6 @@ __global__ void kmeans_update_centers_kernel(float *d_samples, int *d_clusterInd
     }
 }
 
-// __global__ void kmeans_update_centers_kernel(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, int *d_clusterSizes, int N , int K, int DIM)
-// {
-//     int pointNum = blockIdx.x;
-//     int tid = threadIdx.x;
-//     int cluster_id = d_clusterIndices[pointNum];
-
-//     if (tid == 0)
-//     {
-//         atomicAdd(&d_clusterSizes[cluster_id], 1);
-//     }
-
-//     for (int i = tid; i < DIM; i+= blockDim.x)
-//     {
-//         atomicAdd(&d_clusterCenters[cluster_id * DIM + i], d_samples[pointNum * DIM + i]);
-//     }
-
-//     __syncthreads();
-// }
 
 __global__ void kmeans_average_centers_kernel(float *d_clusterCenters, int *d_clusterSizes, int K, int DIM)
 {
@@ -210,8 +152,5 @@ void launch_kmeans_update_center(float *d_samples, int *d_clusterIndices, float 
     int sharedMemSize = sizeof(float) * DIM;
 
     kmeans_update_centers_kernel<<<N, TPB, sharedMemSize>>>(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, K, DIM);
-    //kmeans_update_centers_kernel<<<N, TPB>>>(d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, K, DIM);
-    //kmeans_average_centers_kernel<<<(K + TPB - 1) / TPB, TPB>>>(d_clusterCenters, d_clusterSizes, K, DIM);
 }
-
 

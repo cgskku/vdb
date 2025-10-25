@@ -104,16 +104,29 @@ static std::vector<float> load_parquet_data_multi(const std::vector<std::string>
 double compute_SSE(const std::vector<float>& data, const std::vector<float>& centroids, const std::vector<int>& clusterIndices, std::size_t N, std::size_t K, std::size_t DIM) 
 {
     double sse = 0.0;
+    int invalid_assignments = 0;
+    
     for (std::size_t n = 0; n < N; ++n) 
     {
+        // Check for invalid cluster assignment
+        if (clusterIndices[n] < 0 || clusterIndices[n] >= (int)K) {
+            invalid_assignments++;
+            continue;
+        }
+        
         double squaredDistance = 0.0;
         for (std::size_t d = 0; d < DIM; ++d) 
         {
-            float vecDiff  = data[n * DIM + d] - centroids[clusterIndices[n] * DIM + d];
-            squaredDistance += vecDiff  * vecDiff ;
+            float vecDiff = data[n * DIM + d] - centroids[clusterIndices[n] * DIM + d];
+            squaredDistance += vecDiff * vecDiff;
         }
         sse += squaredDistance;
     }
+    
+    if (invalid_assignments > 0) {
+        std::cout << "[WARNING] Found " << invalid_assignments << " invalid cluster assignments!" << std::endl;
+    }
+    
     return sse;
 }
 
@@ -156,12 +169,22 @@ int main(int argc, char *argv[])
     int*   d_assign     = nullptr;
     int*   d_sizes      = nullptr;
 
-    // @@ chunkSize, TPB setting
+    // Chunk size calculation for dimensions
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
+    
+    // Calculate chunk size based on shared memory and dimension
+    // We need K * chunkSize * sizeof(float) bytes for shared memory
     size_t maxChunkSize = prop.sharedMemPerBlock / (K * sizeof(float));
-    int chunkSize = (int)maxChunkSize - 1;
-    int TPB = 256;//std::__bit_floor(chunkSize) > prop.maxThreadsPerBlock / 2 ? prop.maxThreadsPerBlock / 2 : std::__bit_floor(chunkSize);
+    int chunkSize = std::min((int)maxChunkSize - 10, 32);  // More conservative, max 32
+    
+    // Ensure chunk size doesn't exceed dimension
+    chunkSize = std::min(chunkSize, (int)D);
+    
+    // Ensure chunk size is at least 1
+    if (chunkSize <= 0) chunkSize = 1;
+    
+    int TPB = 256;
 
     std::cout << "Device Setting---------------------------------" << std::endl;
     std::cout << "Device Name: " << prop.name << std::endl;
@@ -171,7 +194,9 @@ int main(int argc, char *argv[])
     std::cout << "Max Threads Per Block(TPB): " << prop.maxThreadsPerBlock << std::endl;
     std::cout << "chunk size: " << chunkSize << std::endl;
     std::cout << "TPB : " << TPB << std::endl;
-    std::cout << "Get Shared Memory : " << K * chunkSize * sizeof(float) << " bytes" <<  std::endl;
+    std::cout << "Required Shared Memory: " << K * chunkSize * sizeof(float) << " bytes" << std::endl;
+    std::cout << "Available Shared Memory: " << prop.sharedMemPerBlock << " bytes" << std::endl;
+    std::cout << "Memory Usage: " << (double)(K * chunkSize * sizeof(float)) / prop.sharedMemPerBlock * 100 << "%" << std::endl;
     std::cout << "-----------------------------------------------" << std::endl;
 
     // Allocate GPU memory
@@ -195,6 +220,13 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Optional: Data normalization
+    std::cout << "Data statistics:" << std::endl;
+    float min_val = *std::min_element(data.begin(), data.end());
+    float max_val = *std::max_element(data.begin(), data.end());
+    float mean_val = std::accumulate(data.begin(), data.end(), 0.0f) / data.size();
+    std::cout << "Min: " << min_val << ", Max: " << max_val << ", Mean: " << mean_val << std::endl;
+    
     // Copy data to GPU
     cudaMemcpy(d_datapoints, data.data(), N * D * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_centroids, h_centroids.data(), K * D * sizeof(float), cudaMemcpyHostToDevice);
@@ -210,18 +242,33 @@ int main(int argc, char *argv[])
     auto start = std::chrono::high_resolution_clock::now();
     for(int it = 1; it <= MAX_ITER; ++it)
     {
-        // Cluster assignment step
+        // Cluster assignment step (using chunk implementation)
         launch_kmeans_labeling_chunk(d_datapoints, d_assign, d_centroids, N, TPB, K, D, chunkSize);
         cudaDeviceSynchronize();
 
-        // Centroid update step
+        // Centroid update step (using chunk implementation)
         launch_kmeans_update_center_chunk(d_datapoints, d_assign, d_centroids, d_sizes, N, TPB, K, D, chunkSize);
         cudaDeviceSynchronize();
 
         cudaMemcpy(h_assign.data(), d_assign, N * sizeof(int), cudaMemcpyDeviceToHost);
         cudaMemcpy(h_centroids.data(), d_centroids, K * D * sizeof(float), cudaMemcpyDeviceToHost);
         
+        // debug
+        std::vector<int> cluster_counts(K, 0);
+        for (std::size_t i = 0; i < N; ++i) {
+            if (h_assign[i] >= 0 && h_assign[i] < (int)K) {
+                cluster_counts[h_assign[i]]++;
+            }
+        }
+        
         const double sse = compute_SSE(data, h_centroids, h_assign, N, K, D);
+        
+        // // debug
+        // std::cout << "Cluster distribution: ";
+        // for (std::size_t k = 0; k < K; ++k) {
+        //     std::cout << cluster_counts[k] << " ";
+        // }
+        // std::cout << std::endl;
 
         // Frobenius norm based convergence check
         if (it > 1) 

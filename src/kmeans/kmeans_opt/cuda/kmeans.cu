@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <math.h>
+#include <cublas_v2.h>
 #include "include/kmeans.h"
 
 __device__ float get_distance(const float* point, const float* centroid, int DIM)
@@ -16,7 +17,7 @@ __device__ float get_distance(const float* point, const float* centroid, int DIM
 
 __global__ void kmeans_labeling_kernel(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, int N, int K, int DIM)
 {
-    const int globalThreadIndex = blockIdx.x * blockDim.x + threadIdx.x; // Calculate the global index of each thread, representing the position of the data point in the array
+    const int globalThreadIndex = blockIdx.x * blockDim.x + threadIdx.x;
     if (globalThreadIndex >= N) return;
 
     float minDistance = INFINITY;
@@ -24,7 +25,6 @@ __global__ void kmeans_labeling_kernel(float *d_samples, int *d_clusterIndices, 
 
     const float* curPoint = &d_samples[globalThreadIndex * DIM];
 
-    // Iterate through cluster centroids to calculate distance
     for (int k = 0; k < K; ++k)
     {
         const float* curCentroid = &d_clusterCenters[k * DIM];
@@ -46,13 +46,12 @@ __global__ void kmeans_update_centers_kernel(float *d_samples, int *d_clusterInd
 
     int cluster_id = d_clusterIndices[globalThreadIndex];
 
-    // Accumulate the coordinates of each data point to the cluster centroid it belongs to
+    // accumulate the coordinates of each data point to the cluster centroid it belongs to
     for (int d = 0; d < DIM; ++d)
     {
         atomicAdd(&d_clusterCenters[cluster_id * DIM + d], d_samples[globalThreadIndex * DIM + d]);
     }
 
-    // Increase the count of data points included in the cluster the current data point belongs to by 1
     atomicAdd(&d_clusterSizes[cluster_id], 1);
 }
 
@@ -61,7 +60,7 @@ __global__ void kmeans_average_centers_kernel(float *d_clusterCenters, int *d_cl
     const int globalThreadIndex = blockIdx.x * blockDim.x + threadIdx.x;
     if (globalThreadIndex >= K) return;
 
-    // Calculate the new centroid of each cluster by computing the average coordinates 
+    // calculate the new centroid of each cluster by computing the average coordinates 
     for (int d = 0; d < DIM; ++d)
     {
         if (d_clusterSizes[globalThreadIndex] > 0) {
@@ -89,7 +88,7 @@ void launch_kmeans_average_centers(float *d_clusterCenters, int *d_clusterSizes,
     kmeans_average_centers_kernel<<<(K + TPB - 1) / TPB, TPB>>>(d_clusterCenters, d_clusterSizes, K, DIM);
 }
 
-// ========== TILING OPTIMIZED KERNELS ==========
+// tiling
 
 __global__ void kmeans_labeling_chunk_kernel(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, int N, int K, int DIM, int chunkSize)
 {
@@ -101,7 +100,7 @@ __global__ void kmeans_labeling_chunk_kernel(float *d_samples, int *d_clusterInd
 
     const float* curPoint = &d_samples[globalThreadIndex * DIM];
 
-    // Process centroids in chunks for better memory access pattern
+    // process centroids in chunks 
     for (int chunk = 0; chunk < (K + chunkSize - 1) / chunkSize; ++chunk)
     {
         int startK = chunk * chunkSize;
@@ -129,7 +128,7 @@ __global__ void kmeans_update_centers_chunk_kernel(float *d_samples, int *d_clus
 
     int cluster_id = d_clusterIndices[globalThreadIndex];
 
-    // Process dimensions in chunks for better memory access pattern
+    // process dimensions in chunks
     for (int chunk = 0; chunk < (DIM + chunkSize - 1) / chunkSize; ++chunk)
     {
         int startD = chunk * chunkSize;
@@ -149,7 +148,7 @@ __global__ void kmeans_average_centers_chunk_kernel(float *d_clusterCenters, int
     const int globalThreadIndex = blockIdx.x * blockDim.x + threadIdx.x;
     if (globalThreadIndex >= K) return;
 
-    // Process dimensions in chunks for better memory access pattern
+    // process dimensions in chunks
     for (int chunk = 0; chunk < (DIM + chunkSize - 1) / chunkSize; ++chunk)
     {
         int startD = chunk * chunkSize;
@@ -164,7 +163,6 @@ __global__ void kmeans_average_centers_chunk_kernel(float *d_clusterCenters, int
     }
 }
 
-// Tiling을 사용한 launch 함수들
 void launch_kmeans_labeling_chunk(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, int N, int TPB, int K, int DIM, int chunkSize)
 {
     kmeans_labeling_chunk_kernel<<<(N + TPB - 1) / TPB, TPB>>>(d_samples, d_clusterIndices, d_clusterCenters, N, K, DIM, chunkSize);
@@ -179,7 +177,6 @@ void launch_kmeans_update_center_chunk(float *d_samples, int *d_clusterIndices, 
     kmeans_average_centers_chunk_kernel<<<(K + TPB - 1) / TPB, TPB>>>(d_clusterCenters, d_clusterSizes, K, DIM, chunkSize);
 }
 
-// ========== TILE-BASED K-MEANS KERNELS ==========
 
 __global__ void kmeans_labeling_tile_kernel(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, 
                                            int N, int K, int DIM, int tile_start, int tile_size)
@@ -194,7 +191,6 @@ __global__ void kmeans_labeling_tile_kernel(float *d_samples, int *d_clusterIndi
 
     const float* curPoint = &d_samples[localIndex * DIM];
 
-    // Iterate through cluster centroids to calculate distance
     for (int k = 0; k < K; ++k)
     {
         const float* curCentroid = &d_clusterCenters[k * DIM];
@@ -220,17 +216,14 @@ __global__ void kmeans_update_centers_tile_kernel(float *d_samples, int *d_clust
 
     int cluster_id = d_clusterIndices[localIndex];
 
-    // Accumulate the coordinates of each data point to the cluster centroid it belongs to
     for (int d = 0; d < DIM; ++d)
     {
         atomicAdd(&d_clusterCenters[cluster_id * DIM + d], d_samples[localIndex * DIM + d]);
     }
 
-    // Increase the count of data points included in the cluster the current data point belongs to by 1
     atomicAdd(&d_clusterSizes[cluster_id], 1);
 }
 
-// Tile-based launch functions
 void launch_kmeans_labeling_tile(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, 
                                 int N, int TPB, int K, int DIM, int tile_start, int tile_size)
 {
@@ -251,8 +244,8 @@ void launch_kmeans_update_center_tile(float *d_samples, int *d_clusterIndices, f
     kmeans_update_centers_tile_kernel<<<(actual_tile_size + TPB - 1) / TPB, TPB>>>(
         d_samples, d_clusterIndices, d_clusterCenters, d_clusterSizes, N, K, DIM, tile_start, actual_tile_size);
 }
-// corner turning (transpose) kernels
 
+// corner turning kernels
 __global__ void transpose_centers_kernel(float *d_centroids, float *d_centroids_T, int K, int DIM)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -275,7 +268,6 @@ __global__ void kmeans_labeling_corner_turning_kernel(float *d_samples, int *d_c
 
     const float* curPoint = &d_samples[globalThreadIndex * DIM];
 
-    // Process centroids with corner turning (transposed layout)
     for (int k = 0; k < K; ++k)
     {
         float distance = 0.0f;
@@ -284,7 +276,6 @@ __global__ void kmeans_labeling_corner_turning_kernel(float *d_samples, int *d_c
             float vecDiff = curPoint[d] - d_centroids_T[d * K + k];
             distance += vecDiff * vecDiff;
         }
-        distance = sqrtf(distance);
         
         if (distance < minDistance)
         {
@@ -309,7 +300,6 @@ __global__ void kmeans_labeling_corner_turning_tile_kernel(float *d_samples, int
 
     const float* curPoint = &d_samples[localIndex * DIM];
 
-    // Process centroids with corner turning (transposed layout)
     for (int k = 0; k < K; ++k)
     {
         float distance = 0.0f;
@@ -318,7 +308,6 @@ __global__ void kmeans_labeling_corner_turning_tile_kernel(float *d_samples, int
             float vecDiff = curPoint[d] - d_centroids_T[d * K + k];
             distance += vecDiff * vecDiff;
         }
-        distance = sqrtf(distance);
         
         if (distance < minDistance)
         {
@@ -330,7 +319,7 @@ __global__ void kmeans_labeling_corner_turning_tile_kernel(float *d_samples, int
     d_clusterIndices[localIndex] = closestCenterIndex;
 }
 
-// Corner turning functions
+// corner turning functions
 void transpose_centers(float *d_centroids, float *d_centroids_T, int K, int DIM, int TPB)
 {
     dim3 block(16, 16);
@@ -377,6 +366,67 @@ void launch_kmeans_labeling_tile_stream(float *d_samples, int *d_clusterIndices,
     
     kmeans_labeling_tile_kernel<<<(actual_tile_size + TPB - 1) / TPB, TPB, 0, stream>>>(
         d_samples, d_clusterIndices, d_clusterCenters, N, K, DIM, tile_start, actual_tile_size);
+}
+
+// for cuBLAS
+__global__ void add_norms_to_distances_kernel(float* d_datapoints, float* d_centroids, 
+                                            float* d_distances, int N, int K, int DIM)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * K) return;
+    
+    int n = idx / K;
+    int k = idx % K;
+    
+    float data_norm = 0.0f;
+    float centroid_norm = 0.0f;
+    
+    for (int d = 0; d < DIM; ++d) {
+        float data_val = d_datapoints[n * DIM + d];
+        float centroid_val = d_centroids[k * DIM + d];
+        data_norm += data_val * data_val;
+        centroid_norm += centroid_val * centroid_val;
+    }
+    
+    d_distances[idx] += data_norm + centroid_norm;
+}
+
+__global__ void find_min_distance_kernel(float* d_distances, int* d_assign, int N, int K)
+{
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    
+    float min_dist = d_distances[n * K];
+    int min_k = 0;
+    
+    for (int k = 1; k < K; ++k) {
+        float dist = d_distances[n * K + k];
+        if (dist < min_dist) {
+            min_dist = dist;
+            min_k = k;
+        }
+    }
+    
+    d_assign[n] = min_k;
+}
+
+void launch_kmeans_labeling_cublas(float* d_datapoints, int* d_assign, float* d_centroids, 
+                                  float* d_distances, int N, int K, int DIM, cublasHandle_t handle) 
+{
+    const float alpha = -2.0f;
+    const float beta = 0.0f;
+    
+    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                N, K, DIM,
+                &alpha, d_datapoints, DIM,
+                d_centroids, DIM,          
+                &beta, d_distances, N);
+    
+    add_norms_to_distances_kernel<<<(N * K + 255) / 256, 256>>>(
+        d_datapoints, d_centroids, d_distances, N, K, DIM);
+    
+    find_min_distance_kernel<<<(N + 255) / 256, 256>>>(
+        d_distances, d_assign, N, K);
 }
 
 void launch_kmeans_update_center_tile_stream(float *d_samples, int *d_clusterIndices, float *d_clusterCenters, 

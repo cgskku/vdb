@@ -37,11 +37,9 @@ nvcc -I<path_to_vcpkg>/installed/x64-linux/include \
 ### 3. Run the K-means Program
 
 ```bash
-./kmeans_openai <path_to_data_file> <threads_per_block> <number_of_clusters> <number_of_iterations>
+./kmeans_openai <path_to_data_file> <threads_per_block> <norm_type>
 ```
 Example
 ```bash
-./kmeans_openai /path/to/data/shuffle_train-00-of-10.parquet 32 25 10
-```
-
-## Visualization
+./kmeans_openai /path/to/data/shuffle_train-00-of-10.parquet 256 cosine
+``

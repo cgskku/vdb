@@ -29,7 +29,7 @@ sudo apt-get install bison
 
 ```bash
 nvcc -I<path_to_vcpkg>/installed/x64-linux/include \
-    load-manager-openai.cpp load-manager.cu -o load-manager \
+    load-manager.cpp load-manager.cu -o load-manager \
     -L<path_to_vcpkg>/installed/x64-linux/lib \
     -larrow -lparquet -lthrift -lcrypto -lzstd -lbrotlidec -lbrotlienc -lbrotlicommon -lbz2 -llz4 -lsnappy -lpthread -lz -ldl -lcublas
 ```

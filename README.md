@@ -1,47 +1,20 @@
-# K-means vector clustering for Inverted File Index build
+# GPU-Accelerated Vector Processing Toolkit
 
-This project implements a CUDA-accelerated K-means clustering algorithm for building an inverted file index. 
-It leverages `Arrow` and `Parquet` libraries for handling large datasets efficiently.
+This repository provides a collection of **CUDA-accelerated modules** for large-scale vector processing and clustering.  
+It includes both the **K-means Clustering** module, optimized for building Inverted File (IVF) indices, and the **Load Manager**, which efficiently handles massive vector data on GPUs.
+These components can be used independently or together as part of a GPU-based vector indexing and search pipeline.
 
-## Quickstart
-
-Follow these steps to set up and run the project:
-
-### 1. Clone the Repository and Install Dependencies
-
-```bash
-# Clone the vcpkg package manager repository
-git clone https://github.com/microsoft/vcpkg.git
-cd vcpkg
-
-# Bootstrap vcpkg
-./bootstrap-vcpkg.sh
-
-# Install dependencies for vcpkg
-sudo apt-get install flex
-sudo apt-get install bison
-
-# Install necessary libraries via vcpkg
-./vcpkg install arrow parquet
-```
-
-### 2. Build the K-means Program
-
-```bash
-nvcc -I<path_to_vcpkg>/installed/x64-linux/include \
-    kmeans_openai.cpp kmeans.cu -o kmeans_openai \
-    -L<path_to_vcpkg>/installed/x64-linux/lib \
-    -larrow -lparquet -lthrift -lcrypto -lzstd -lbrotlidec -lbrotlienc -lbrotlicommon -lbz2 -llz4 -lsnappy -lpthread -lz -ldl
-```
-
-### 3. Run the K-means Program
-
-```bash
-./kmeans_openai <path_to_data_file> <threads_per_block> <number_of_clusters> <number_of_iterations>
-```
-Example
-```bash
-./kmeans_openai /path/to/data/shuffle_train-00-of-10.parquet 32 25 10
-```
-
-## Visualization
+## Repository Structure
+```plaintext
+src/
+├── kmeans-vector-clustering/   # CUDA-based K-means clustering for IVF index build
+│   ├── kmeans_openai.cpp
+│   ├── kmeans.cu
+│   ├── README.md
+│   └── ...
+│
+├── load-manager/               # GPU Load Manager with tile-based memory control
+    ├── load-manager.cpp
+    ├── load-manager.cu
+    ├── README.md
+    └── ...

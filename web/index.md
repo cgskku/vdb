@@ -16,7 +16,7 @@ It focuses on high-dimensional vector clustering, distance computation, and effi
 - [CUDA K-Means Clustering](./kmeans.md)  
   GPU-parallelized K-Means algorithm optimized for high-dimensional datasets.
 
-- [Asynchronous Vector Distance & Memory Load Manager](./load-manager.md)  
+- [Asynchronous Vector Distance & Memory Load Manager](./load_manager.md)  
   Asynchronous CUDA pipeline with dual-stream architecture for large-scale vector distance computation.
 
 ---

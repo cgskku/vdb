@@ -1,6 +1,7 @@
 ---
-title: VDB Web Docs
-permalink: /vdb/web/
+layout: default
+title: Redirect
+redirect_to: /vdb/web/README.html
 ---
 
 # Vector Database Acceleration Project

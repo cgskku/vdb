@@ -1,3 +1,8 @@
+---
+title: VDB Web Docs
+permalink: /vdb/web/
+---
+
 # CUDA K-Means Clustering with GPU Acceleration for High-Dimensional Data
 
 This project leverages CUDA-based GPU acceleration to optimize vector database operations, focusing on index building performance.

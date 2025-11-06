@@ -1,9 +1,3 @@
----
-title: Asynchronous Vector Distance & Memory Load Manager
-layout: default
-permalink: /vdb/web/load_manager/
----
-
 # Asynchronous GPU-Accelerated Vector Distance Computation and Dynamic Memory Load Manager
 
 This project extends the previous year's GPU-based vector clustering work by developing an asynchronous GPU acceleration framework for large-scale vector distance computation.  

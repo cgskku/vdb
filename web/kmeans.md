@@ -1,3 +1,9 @@
+---
+title: CUDA K-Means Clustering
+layout: default
+permalink: /vdb/web/kmeans/
+---
+
 # CUDA K-Means Clustering with GPU Acceleration for High-Dimensional Data
 
 This project leverages CUDA-based GPU acceleration to optimize vector database operations, focusing on index building performance.

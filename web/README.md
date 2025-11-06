@@ -1,6 +1,5 @@
 ---
 title: VDB Web Docs
-layout: default
 permalink: /vdb/web/
 ---
 
@@ -27,3 +26,5 @@ It focuses on high-dimensional vector clustering, distance computation, and effi
 **Funding Agency:** IITP (SW컴퓨팅산업원천기술개발사업)  
 **Grant No.:** RS-2024-00454666  
 **Duration:** 2024.7 — 2027.12
+
+---

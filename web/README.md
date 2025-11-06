@@ -1,7 +1,7 @@
 ---
+title: VDB Web Docs
 layout: default
-title: Redirect
-redirect_to: /vdb/web/README.html
+permalink: /vdb/web/
 ---
 
 # Vector Database Acceleration Project
@@ -13,10 +13,10 @@ It focuses on high-dimensional vector clustering, distance computation, and effi
 
 ## 📘 Project Sections
 
-- [CUDA K-Means Clustering](./kmeans.md)  
+- [CUDA K-Means Clustering](./kmeans/)  
   GPU-parallelized K-Means algorithm optimized for high-dimensional datasets.
 
-- [Asynchronous Vector Distance & Memory Load Manager](./load_manager.md)  
+- [Asynchronous Vector Distance & Memory Load Manager](./load_manager/)  
   Asynchronous CUDA pipeline with dual-stream architecture for large-scale vector distance computation.
 
 ---

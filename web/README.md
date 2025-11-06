@@ -1,8 +1,3 @@
----
-title: VDB Web Docs
-permalink: /vdb/web/
----
-
 # Vector Database Acceleration Project
 
 This repository contains research and implementation details for GPU-accelerated vector database modules.  

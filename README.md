@@ -14,7 +14,13 @@ src/
 │   └── ...
 │
 ├── load-manager/               # GPU Load Manager with tile-based memory control
-    ├── load-manager.cpp
-    ├── load-manager.cu
+│   ├── load-manager.cpp
+│   ├── load-manager.cu
+│   ├── README.md
+│   └── ...
+│
+├── gpu-topk-sort/               # GPU Top-k Sort for vector candidate lists
+    ├── gpu_sort.cpp
+    ├── gpu_sort.cu
     ├── README.md
     └── ...

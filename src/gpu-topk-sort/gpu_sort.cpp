@@ -347,6 +347,14 @@ void print_cpu_profile(const CpuPhaseProfile& best, const CpuPhaseProfile& avg) 
               << avg.total_ms << " ms avg\n";
 }
 
+// Summarize the flat segmented workload shape before running benchmarks.
+static void print_workload_layout(const Options& opt) {
+    size_t candidates = static_cast<size_t>(opt.groups) * opt.group_size;
+    size_t outputs = static_cast<size_t>(opt.groups) * opt.topk;
+    std::cout << "Workload layout: " << candidates << " candidate pairs, "
+              << outputs << " retained top-k pairs\n";
+}
+
 // Drive input loading, reference generation, optional GPU paths, and reporting.
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
@@ -355,6 +363,7 @@ int run_gpu_sort_demo(int argc, char** argv) {
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams
                   << " repeats=" << opt.repeats << "\n";
+        print_workload_layout(opt);
         if (!opt.keys_bin_path.empty()) {
             std::cout << "OpenAI binary sort workload: " << opt.keys_bin_path << "\n";
         }

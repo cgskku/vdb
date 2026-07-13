@@ -18,7 +18,7 @@
 // Runtime options that define the segmented top-k workload.
 struct Options {
     // Benchmark shape and controls.
-    int groups = 64;
+    int groups = 256;
     int group_size = 64;
     int topk = 8;
     int streams = 1;

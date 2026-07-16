@@ -1,3 +1,4 @@
+
 #include "gpu_sort.h"
 
 #include <algorithm>
@@ -26,7 +27,6 @@ Options parse_options(int argc, char** argv) {
     Options opt;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        // Fail early on invalid benchmark settings.
         auto need_value = [&](const char* name) -> const char* {
             if (i + 1 >= argc) {
                 throw std::runtime_error(std::string("missing value for ") + name);
@@ -89,7 +89,6 @@ std::vector<float> make_synthetic_keys(const Options& opt) {
     std::uniform_real_distribution<float> noise(0.0f, 1.0f);
     std::vector<float> keys(static_cast<size_t>(opt.groups) * opt.group_size);
     for (int g = 0; g < opt.groups; ++g) {
-        // Stable, non-uniform synthetic distances.
         float group_bias = static_cast<float>((g * 17) % 113) * 0.001f;
         for (int i = 0; i < opt.group_size; ++i) {
             float locality = static_cast<float>((i * 31 + g * 7) % 257) * 0.0001f;
@@ -122,7 +121,6 @@ static std::vector<T> load_binary_vector(const std::string& path, size_t expecte
     in.seekg(0, std::ios::beg);
     if (bytes < 0 || static_cast<size_t>(bytes) != expected_count * sizeof(T)) {
         std::ostringstream oss;
-        // Usually means groups/group-size do not match the workload.
         oss << label << " file size mismatch: got " << bytes
             << " bytes, expected " << expected_count * sizeof(T);
         throw std::runtime_error(oss.str());
@@ -178,7 +176,6 @@ void cpu_segmented_topk(
         for (int i = 0; i < group_size; ++i) {
             row.emplace_back(keys[base + i], values[base + i]);
         }
-        // Top-k is exact; the tail can stay unordered.
         if (topk < group_size) {
             std::partial_sort(row.begin(), row.begin() + topk, row.end());
         } else {
@@ -221,7 +218,6 @@ CpuPhaseProfile cpu_segmented_topk_profiled(
 
     for (int g = 0; g < groups; ++g) {
         auto index_start = clock::now();
-        // Contiguous group slices in flat arrays.
         size_t input_base = static_cast<size_t>(g) * group_size;
         size_t output_base = static_cast<size_t>(g) * topk;
         auto index_end = clock::now();
@@ -337,7 +333,6 @@ void print_cpu_profile(const CpuPhaseProfile& best, const CpuPhaseProfile& avg) 
     print_row("row fill", best.row_fill_ms, avg.row_fill_ms, best.total_ms);
     print_row("partial sort", best.topk_sort_ms, avg.topk_sort_ms, best.total_ms);
     print_row("output store", best.output_store_ms, avg.output_store_ms, best.total_ms);
-    // Loop bookkeeping and fine-grained timer overhead.
     double best_unaccounted = best.total_ms - measured_sum(best);
     double avg_unaccounted = avg.total_ms - measured_sum(avg);
     print_row("loop/timer overhead", best_unaccounted, avg_unaccounted, best.total_ms);
@@ -355,15 +350,24 @@ static void print_workload_layout(const Options& opt) {
               << outputs << " retained top-k pairs\n";
 }
 
+// Report the input and output buffer sizes implied by the workload.
+static void print_buffer_footprint(const Options& opt) {
+    size_t input_bytes = static_cast<size_t>(opt.groups) * opt.group_size * (sizeof(float) + sizeof(int));
+    size_t output_bytes = static_cast<size_t>(opt.groups) * opt.topk * (sizeof(float) + sizeof(int));
+    std::cout << "Buffer footprint: input=" << input_bytes
+              << " bytes output=" << output_bytes << " bytes\n";
+}
+
 // Drive input loading, reference generation, optional GPU paths, and reporting.
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
-        std::cout << "GPU sorting benchmark: Project scaffold and CPU top-k sorting baseline\n";
+        std::cout << "GPU sorting benchmark: GPU warmup and timing harness\n";
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams
                   << " repeats=" << opt.repeats << "\n";
         print_workload_layout(opt);
+        print_buffer_footprint(opt);
         if (!opt.keys_bin_path.empty()) {
             std::cout << "OpenAI binary sort workload: " << opt.keys_bin_path << "\n";
         }
@@ -402,6 +406,13 @@ int run_gpu_sort_demo(int argc, char** argv) {
         std::vector<BenchResult> results;
         results.push_back({"cpu_partial_sort", cpu_ms, true});
         print_first_group(cpu_keys, cpu_values, opt.topk);
+
+#if GPU_SORT_HAS_CUDA
+        run_warmup_kernel(keys);
+        std::cout << "GPU warmup completed.\n";
+#else
+        std::cout << "CUDA runtime was not available at build time; GPU sections skipped.\n";
+#endif
 
         std::cout << "\nBenchmark summary\n";
         for (const auto& result : results) {

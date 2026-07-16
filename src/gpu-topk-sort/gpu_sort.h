@@ -17,7 +17,6 @@
 
 // Runtime options that define the segmented top-k workload.
 struct Options {
-    // Benchmark shape and controls.
     int groups = 256;
     int group_size = 64;
     int topk = 8;
@@ -25,7 +24,6 @@ struct Options {
     int repeats = 1;
     int seed = 1234;
     bool profile_cpu = false;
-    // Optional external workload files.
     std::string keys_bin_path;
     std::string values_bin_path;
 };
@@ -39,7 +37,6 @@ struct BenchResult {
 
 // Per-phase CPU timing used to identify the baseline bottleneck.
 struct CpuPhaseProfile {
-    // CPU phase timings.
     double total_ms = 0.0;
     double output_init_ms = 0.0;
     double group_index_ms = 0.0;
@@ -61,6 +58,16 @@ bool validate_topk(const std::vector<float>& ref_keys, const std::vector<int>& r
 void print_first_group(const std::vector<float>& keys, const std::vector<int>& values, int topk);
 void print_cpu_profile(const CpuPhaseProfile& best, const CpuPhaseProfile& avg);
 
+// CUDA entrypoints are declared only when the runtime headers are available.
+#if GPU_SORT_HAS_CUDA
+void run_warmup_kernel(const std::vector<float>& keys);
+BenchResult run_gpu_insertion(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
+BenchResult run_gpu_bitonic(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
+bool use_insertion_path(const Options& opt);
+BenchResult run_gpu_adaptive(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
+BenchResult run_gpu_scheduler(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
+BenchResult run_distance_tile_topk_adapter(const Options& opt, const std::vector<float>& tile_distances, std::vector<float>& out_keys, std::vector<int>& out_values);
+#endif
 
 int run_gpu_sort_demo(int argc, char** argv);
 

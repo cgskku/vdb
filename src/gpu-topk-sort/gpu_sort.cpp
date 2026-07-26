@@ -358,11 +358,17 @@ static void print_buffer_footprint(const Options& opt) {
               << " bytes output=" << output_bytes << " bytes\n";
 }
 
+// Explain how many top-k pairs are checked against the reference output.
+static void print_validation_scope(const Options& opt) {
+    std::cout << "Validation scope: compare " << static_cast<size_t>(opt.groups) * opt.topk
+              << " top-k distance/id pairs against CPU reference\n";
+}
+
 // Drive input loading, reference generation, optional GPU paths, and reporting.
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
-        std::cout << "GPU sorting benchmark: GPU warmup and timing harness\n";
+        std::cout << "GPU sorting benchmark: Validation for GPU small-group top-k\n";
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams
                   << " repeats=" << opt.repeats << "\n";
@@ -406,12 +412,17 @@ int run_gpu_sort_demo(int argc, char** argv) {
         std::vector<BenchResult> results;
         results.push_back({"cpu_partial_sort", cpu_ms, true});
         print_first_group(cpu_keys, cpu_values, opt.topk);
+        print_validation_scope(opt);
 
 #if GPU_SORT_HAS_CUDA
         run_warmup_kernel(keys);
         std::cout << "GPU warmup completed.\n";
 #else
         std::cout << "CUDA runtime was not available at build time; GPU sections skipped.\n";
+#endif
+
+#if GPU_SORT_HAS_CUDA
+        results.push_back(run_gpu_insertion(opt, keys, values, cpu_keys, cpu_values));
 #endif
 
         std::cout << "\nBenchmark summary\n";

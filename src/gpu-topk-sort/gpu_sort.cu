@@ -97,4 +97,85 @@ void run_warmup_kernel(const std::vector<float>& keys) {
     CUDA_CHECK(cudaFree(d_tmp));
 }
 
+// Select top-k values for each group using one lightweight insertion path per block.
+__global__ void segmented_insertion_topk_kernel(
+    const float* keys,
+    const int* values,
+    int group_size,
+    int topk,
+    int group_offset,
+    float* out_keys,
+    int* out_values) {
+    int local_group = blockIdx.x;
+    int group = group_offset + local_group;
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    float best_keys[GPU_SORT_MAX_TOPK];
+    int best_values[GPU_SORT_MAX_TOPK];
+    for (int k = 0; k < topk; ++k) {
+        best_keys[k] = INFINITY;
+        best_values[k] = -1;
+    }
+
+    const int base = group * group_size;
+    for (int i = 0; i < group_size; ++i) {
+        float key = keys[base + i];
+        int value = values[base + i];
+        if (key > best_keys[topk - 1] || (key == best_keys[topk - 1] && value >= best_values[topk - 1])) {
+            continue;
+        }
+        int pos = topk - 1;
+        while (pos > 0 && (key < best_keys[pos - 1] || (key == best_keys[pos - 1] && value < best_values[pos - 1]))) {
+            best_keys[pos] = best_keys[pos - 1];
+            best_values[pos] = best_values[pos - 1];
+            --pos;
+        }
+        best_keys[pos] = key;
+        best_values[pos] = value;
+    }
+
+    const int out_base = group * topk;
+    for (int k = 0; k < topk; ++k) {
+        out_keys[out_base + k] = best_keys[k];
+        out_values[out_base + k] = best_values[k];
+    }
+}
+
+// Execute and validate the insertion-based segmented GPU top-k path.
+BenchResult run_gpu_insertion(
+    const Options& opt,
+    const std::vector<float>& keys,
+    const std::vector<int>& values,
+    const std::vector<float>& ref_keys,
+    const std::vector<int>& ref_values,
+    std::vector<float>* final_keys,
+    std::vector<int>* final_values) {
+    DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
+    double best_ms = std::numeric_limits<double>::infinity();
+    for (int r = 0; r < opt.repeats; ++r) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double start = now_ms();
+        segmented_insertion_topk_kernel<<<opt.groups, 32>>>(
+            buffers.d_keys, buffers.d_values, opt.group_size, opt.topk, 0,
+            buffers.d_out_keys, buffers.d_out_values);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        best_ms = std::min(best_ms, now_ms() - start);
+    }
+    std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
+    std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
+    copy_to_host(got_keys, buffers.d_out_keys);
+    copy_to_host(got_values, buffers.d_out_values);
+    bool ok = validate_topk(ref_keys, ref_values, got_keys, got_values, opt.groups, opt.topk);
+    if (final_keys) {
+        *final_keys = got_keys;
+    }
+    if (final_values) {
+        *final_values = got_values;
+    }
+    return {"gpu_insertion_segmented_topk", best_ms, ok};
+}
+
 #endif

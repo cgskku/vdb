@@ -17,7 +17,7 @@ make
 ### 2. Run with Synthetic Data
 
 ```bash
-./gpu_sort --groups 64 --group-size 64 --topk 8 --repeats 2
+./gpu_sort --groups 512 --group-size 128 --topk 16 --repeats 3
 ```
 
 This creates deterministic synthetic distance values and runs the segmented top-k baseline.
@@ -37,6 +37,20 @@ The staged OpenAI workload uses a compact binary input generated from the downlo
   --values-bin <path_to_int_candidate_ids>
 ```
 
+To print a detailed CPU phase breakdown:
+
+```bash
+./gpu_sort \
+  --groups <num_groups> \
+  --group-size <candidates_per_group> \
+  --topk <topk> \
+  --repeats <num_repeats> \
+  --streams <num_streams> \
+  --keys-bin <path_to_float_distance_keys> \
+  --values-bin <path_to_int_candidate_ids> \
+  --profile-cpu
+```
+
 #### Arguments
 
 The program treats the input as a set of independent candidate groups.
@@ -51,5 +65,6 @@ For each group, it sorts the candidate distance/id pairs and keeps only the near
 | `--streams <num_streams>` | Reserved stream-count option kept for compatibility with later GPU implementations. |
 | `--keys-bin <path_to_float_distance_keys>` | Path to a binary `float32` file containing precomputed distance keys. The file must contain `groups * group_size` values. |
 | `--values-bin <path_to_int_candidate_ids>` | Path to a binary `int32` file containing candidate vector IDs aligned with `keys-bin`. The file must contain `groups * group_size` values. |
+| `--profile-cpu` | Prints a phase-level CPU timing breakdown for the selected CPU path. |
 
 If `--keys-bin` and `--values-bin` are omitted, the program generates deterministic synthetic data.

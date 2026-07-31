@@ -364,11 +364,18 @@ static void print_validation_scope(const Options& opt) {
               << " top-k distance/id pairs against CPU reference\n";
 }
 
+// Show the active top-k bounds used by the current executable.
+static void print_topk_guard(const Options& opt) {
+    std::cout << "Top-k guard: requested k=" << opt.topk
+              << " within group_size=" << opt.group_size
+              << " and max_k=" << GPU_SORT_MAX_TOPK << "\n";
+}
+
 // Drive input loading, reference generation, optional GPU paths, and reporting.
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
-        std::cout << "GPU sorting benchmark: Validation for GPU small-group top-k\n";
+        std::cout << "GPU sorting benchmark: Micro-sort tuning parameters\n";
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams
                   << " repeats=" << opt.repeats << "\n";
@@ -413,6 +420,7 @@ int run_gpu_sort_demo(int argc, char** argv) {
         results.push_back({"cpu_partial_sort", cpu_ms, true});
         print_first_group(cpu_keys, cpu_values, opt.topk);
         print_validation_scope(opt);
+        print_topk_guard(opt);
 
 #if GPU_SORT_HAS_CUDA
         run_warmup_kernel(keys);

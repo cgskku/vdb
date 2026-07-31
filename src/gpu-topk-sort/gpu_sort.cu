@@ -178,4 +178,82 @@ BenchResult run_gpu_insertion(
     return {"gpu_insertion_segmented_topk", best_ms, ok};
 }
 
+// Sort one group per block in shared memory with a bitonic network.
+__global__ void segmented_bitonic_topk_kernel(
+    const float* keys,
+    const int* values,
+    int group_size,
+    int topk,
+    int group_offset,
+    float* out_keys,
+    int* out_values) {
+    extern __shared__ unsigned char shared_raw[];
+    float* s_keys = reinterpret_cast<float*>(shared_raw);
+    int* s_values = reinterpret_cast<int*>(s_keys + blockDim.x);
+
+    int tid = threadIdx.x;
+    int local_group = blockIdx.x;
+    int group = group_offset + local_group;
+    int input_idx = group * group_size + tid;
+
+    if (tid < group_size) {
+        s_keys[tid] = keys[input_idx];
+        s_values[tid] = values[input_idx];
+    } else {
+        s_keys[tid] = INFINITY;
+        s_values[tid] = -1;
+    }
+    __syncthreads();
+
+    for (int k = 2; k <= blockDim.x; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            int ixj = tid ^ j;
+            if (ixj > tid) {
+                bool ascending = ((tid & k) == 0);
+                float a = s_keys[tid];
+                float b = s_keys[ixj];
+                int av = s_values[tid];
+                int bv = s_values[ixj];
+                bool pair_gt = (a > b) || (a == b && av > bv);
+                bool pair_lt = (a < b) || (a == b && av < bv);
+                bool swap = ascending ? pair_gt : pair_lt;
+                if (swap) {
+                    s_keys[tid] = b;
+                    s_keys[ixj] = a;
+                    s_values[tid] = bv;
+                    s_values[ixj] = av;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (tid < topk) {
+        int out_idx = group * topk + tid;
+        out_keys[out_idx] = s_keys[tid];
+        out_values[out_idx] = s_values[tid];
+    }
+}
+
+// Launch bitonic sorting for a contiguous range of segmented groups.
+static void launch_bitonic_range(
+    const DeviceBuffers& buffers,
+    int group_size,
+    int topk,
+    int group_offset,
+    int group_count,
+    cudaStream_t stream = 0) {
+    int threads = next_power_of_two(group_size);
+    if (threads < topk) {
+        threads = next_power_of_two(topk);
+    }
+    if (threads > 1024) {
+        throw std::runtime_error("bitonic path supports group_size <= 1024 in this implementation");
+    }
+    size_t shmem = static_cast<size_t>(threads) * (sizeof(float) + sizeof(int));
+    segmented_bitonic_topk_kernel<<<group_count, threads, shmem, stream>>>(
+        buffers.d_keys, buffers.d_values, group_size, topk, group_offset,
+        buffers.d_out_keys, buffers.d_out_values);
+}
+
 #endif

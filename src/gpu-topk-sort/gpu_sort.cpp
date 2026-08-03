@@ -375,7 +375,7 @@ static void print_topk_guard(const Options& opt) {
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
-        std::cout << "GPU sorting benchmark: Micro-sort tuning parameters\n";
+        std::cout << "GPU sorting benchmark: Block-level bitonic segmented sort\n";
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams
                   << " repeats=" << opt.repeats << "\n";
@@ -431,6 +431,14 @@ int run_gpu_sort_demo(int argc, char** argv) {
 
 #if GPU_SORT_HAS_CUDA
         results.push_back(run_gpu_insertion(opt, keys, values, cpu_keys, cpu_values));
+        results.push_back(run_gpu_insertion_end_to_end(opt, keys, values, cpu_keys, cpu_values));
+#endif
+
+#if GPU_SORT_HAS_CUDA
+        if (opt.group_size <= 1024) {
+            results.push_back(run_gpu_bitonic(opt, keys, values, cpu_keys, cpu_values));
+            results.push_back(run_gpu_bitonic_end_to_end(opt, keys, values, cpu_keys, cpu_values));
+        }
 #endif
 
         std::cout << "\nBenchmark summary\n";

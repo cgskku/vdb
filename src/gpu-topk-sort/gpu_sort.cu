@@ -289,41 +289,31 @@ BenchResult run_gpu_bitonic(
     return {"gpu_bitonic_segmented_topk", best_ms, ok};
 }
 
-
-// Measure one complete insertion request from device preparation through host output.
-BenchResult run_gpu_insertion_end_to_end(
-    const Options& opt,
-    const std::vector<float>& keys,
-    const std::vector<int>& values,
-    const std::vector<float>& ref_keys,
-    const std::vector<int>& ref_values) {
-    double best_ms = std::numeric_limits<double>::infinity();
-    bool best_valid = false;
-    for (int r = 0; r < opt.repeats; ++r) {
-        double start = now_ms();
-        DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        segmented_insertion_topk_kernel<<<opt.groups, 32>>>(
-            buffers.d_keys, buffers.d_values, opt.group_size, opt.topk, 0,
-            buffers.d_out_keys, buffers.d_out_values);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-        std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
-        std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
-        copy_to_host(got_keys, buffers.d_out_keys);
-        copy_to_host(got_values, buffers.d_out_values);
-        double elapsed = now_ms() - start;
-        if (elapsed < best_ms) {
-            best_ms = elapsed;
-            best_valid = validate_topk(
-                ref_keys, ref_values, got_keys, got_values, opt.groups, opt.topk);
-        }
-    }
-    return {"gpu_insertion_end_to_end", best_ms, best_valid};
+// Choose the cheaper insertion path for small groups or very small k.
+bool use_insertion_path(const Options& opt) {
+    return opt.group_size <= 64 || opt.topk <= 8;
 }
 
+// Dispatch each group range to insertion or bitonic sorting based on workload shape.
+static void launch_adaptive_range(
+    const DeviceBuffers& buffers,
+    int group_size,
+    int topk,
+    int group_offset,
+    int group_count,
+    cudaStream_t stream = 0) {
+    if (group_size <= 64 || topk <= 8) {
+        segmented_insertion_topk_kernel<<<group_count, 32, 0, stream>>>(
+            buffers.d_keys, buffers.d_values, group_size, topk, group_offset,
+            buffers.d_out_keys, buffers.d_out_values);
+    } else {
+        launch_bitonic_range(buffers, group_size, topk, group_offset, group_count, stream);
+    }
+}
+
+
 // Measure one complete bitonic request from device preparation through host output.
-BenchResult run_gpu_bitonic_end_to_end(
+BenchResult run_gpu_end_to_end(
     const Options& opt,
     const std::vector<float>& keys,
     const std::vector<int>& values,
@@ -349,7 +339,7 @@ BenchResult run_gpu_bitonic_end_to_end(
                 ref_keys, ref_values, got_keys, got_values, opt.groups, opt.topk);
         }
     }
-    return {"gpu_bitonic_end_to_end", best_ms, best_valid};
+    return {"gpu_end_to_end", best_ms, best_valid};
 }
 
 #endif

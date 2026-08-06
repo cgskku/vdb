@@ -61,8 +61,7 @@ void print_cpu_profile(const CpuPhaseProfile& best, const CpuPhaseProfile& avg);
 // CUDA entrypoints are declared only when the runtime headers are available.
 #if GPU_SORT_HAS_CUDA
 void run_warmup_kernel(const std::vector<float>& keys);
-BenchResult run_gpu_insertion_end_to_end(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values);
-BenchResult run_gpu_bitonic_end_to_end(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values);
+BenchResult run_gpu_end_to_end(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values);
 BenchResult run_gpu_insertion(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
 BenchResult run_gpu_bitonic(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
 bool use_insertion_path(const Options& opt);

@@ -371,11 +371,19 @@ static void print_topk_guard(const Options& opt) {
               << " and max_k=" << GPU_SORT_MAX_TOPK << "\n";
 }
 
+// Summarize how much candidate data remains after top-k compaction.
+static void print_compaction_plan(const Options& opt) {
+    size_t full_pairs = static_cast<size_t>(opt.groups) * opt.group_size;
+    size_t kept_pairs = static_cast<size_t>(opt.groups) * opt.topk;
+    std::cout << "Compaction plan: keep " << kept_pairs << " of " << full_pairs
+              << " candidate pairs after sorting\n";
+}
+
 // Drive input loading, reference generation, optional GPU paths, and reporting.
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
-        std::cout << "GPU sorting benchmark: Block-level bitonic segmented sort\n";
+        std::cout << "GPU sorting benchmark: Bitonic top-k output compaction\n";
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams
                   << " repeats=" << opt.repeats << "\n";
@@ -421,6 +429,7 @@ int run_gpu_sort_demo(int argc, char** argv) {
         print_first_group(cpu_keys, cpu_values, opt.topk);
         print_validation_scope(opt);
         print_topk_guard(opt);
+        print_compaction_plan(opt);
 
 #if GPU_SORT_HAS_CUDA
         run_warmup_kernel(keys);
@@ -431,13 +440,12 @@ int run_gpu_sort_demo(int argc, char** argv) {
 
 #if GPU_SORT_HAS_CUDA
         results.push_back(run_gpu_insertion(opt, keys, values, cpu_keys, cpu_values));
-        results.push_back(run_gpu_insertion_end_to_end(opt, keys, values, cpu_keys, cpu_values));
 #endif
 
 #if GPU_SORT_HAS_CUDA
         if (opt.group_size <= 1024) {
             results.push_back(run_gpu_bitonic(opt, keys, values, cpu_keys, cpu_values));
-            results.push_back(run_gpu_bitonic_end_to_end(opt, keys, values, cpu_keys, cpu_values));
+        results.push_back(run_gpu_end_to_end(opt, keys, values, cpu_keys, cpu_values));
         }
 #endif
 

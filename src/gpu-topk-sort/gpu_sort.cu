@@ -311,8 +311,41 @@ static void launch_adaptive_range(
     }
 }
 
+// Execute and validate the adaptive GPU segmented top-k path.
+BenchResult run_gpu_adaptive(
+    const Options& opt,
+    const std::vector<float>& keys,
+    const std::vector<int>& values,
+    const std::vector<float>& ref_keys,
+    const std::vector<int>& ref_values,
+    std::vector<float>* final_keys,
+    std::vector<int>* final_values) {
+    DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
+    double best_ms = std::numeric_limits<double>::infinity();
+    for (int r = 0; r < opt.repeats; ++r) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double start = now_ms();
+        launch_adaptive_range(buffers, opt.group_size, opt.topk, 0, opt.groups);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        best_ms = std::min(best_ms, now_ms() - start);
+    }
+    std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
+    std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
+    copy_to_host(got_keys, buffers.d_out_keys);
+    copy_to_host(got_values, buffers.d_out_values);
+    bool ok = validate_topk(ref_keys, ref_values, got_keys, got_values, opt.groups, opt.topk);
+    if (final_keys) {
+        *final_keys = got_keys;
+    }
+    if (final_values) {
+        *final_values = got_values;
+    }
+    return {"gpu_adaptive_segmented_topk", best_ms, ok};
+}
 
-// Measure one complete bitonic request from device preparation through host output.
+
+// Measure one complete adaptive request from device preparation through host output.
 BenchResult run_gpu_end_to_end(
     const Options& opt,
     const std::vector<float>& keys,
@@ -325,7 +358,7 @@ BenchResult run_gpu_end_to_end(
         double start = now_ms();
         DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
         CUDA_CHECK(cudaDeviceSynchronize());
-        launch_bitonic_range(buffers, opt.group_size, opt.topk, 0, opt.groups);
+        launch_adaptive_range(buffers, opt.group_size, opt.topk, 0, opt.groups);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);

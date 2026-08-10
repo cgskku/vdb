@@ -383,7 +383,7 @@ static void print_compaction_plan(const Options& opt) {
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
-        std::cout << "GPU sorting benchmark: Bitonic top-k output compaction\n";
+        std::cout << "GPU sorting benchmark: Adaptive small-vs-medium sort dispatcher\n";
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams
                   << " repeats=" << opt.repeats << "\n";
@@ -445,8 +445,13 @@ int run_gpu_sort_demo(int argc, char** argv) {
 #if GPU_SORT_HAS_CUDA
         if (opt.group_size <= 1024) {
             results.push_back(run_gpu_bitonic(opt, keys, values, cpu_keys, cpu_values));
-        results.push_back(run_gpu_end_to_end(opt, keys, values, cpu_keys, cpu_values));
         }
+#endif
+
+#if GPU_SORT_HAS_CUDA
+        std::cout << "Adaptive dispatcher selected " << (use_insertion_path(opt) ? "insertion" : "bitonic") << " for this workload.\n";
+        results.push_back(run_gpu_adaptive(opt, keys, values, cpu_keys, cpu_values));
+        results.push_back(run_gpu_end_to_end(opt, keys, values, cpu_keys, cpu_values));
 #endif
 
         std::cout << "\nBenchmark summary\n";

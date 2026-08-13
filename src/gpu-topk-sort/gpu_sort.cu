@@ -97,23 +97,25 @@ void run_warmup_kernel(const std::vector<float>& keys) {
     CUDA_CHECK(cudaFree(d_tmp));
 }
 
-// Select top-k values for each group using one lightweight insertion path per block.
-__global__ void segmented_insertion_topk_kernel(
+// Let each thread maintain the insertion top-k list for one independent group.
+template <int TOPK_CAPACITY>
+__global__ void segmented_parallel_insertion_topk_kernel(
     const float* keys,
     const int* values,
     int group_size,
     int topk,
     int group_offset,
+    int group_count,
     float* out_keys,
     int* out_values) {
-    int local_group = blockIdx.x;
-    int group = group_offset + local_group;
-    if (threadIdx.x != 0) {
+    int local_group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local_group >= group_count) {
         return;
     }
+    int group = group_offset + local_group;
 
-    float best_keys[GPU_SORT_MAX_TOPK];
-    int best_values[GPU_SORT_MAX_TOPK];
+    float best_keys[TOPK_CAPACITY];
+    int best_values[TOPK_CAPACITY];
     for (int k = 0; k < topk; ++k) {
         best_keys[k] = INFINITY;
         best_values[k] = -1;
@@ -143,6 +145,54 @@ __global__ void segmented_insertion_topk_kernel(
     }
 }
 
+// Limit threads as the per-thread top-k state grows to avoid excessive register pressure.
+template <int TOPK_CAPACITY>
+static void launch_parallel_insertion_with_capacity(
+    const DeviceBuffers& buffers,
+    int group_size,
+    int topk,
+    int group_offset,
+    int group_count,
+    int threads,
+    cudaStream_t stream) {
+    int blocks = (group_count + threads - 1) / threads;
+    segmented_parallel_insertion_topk_kernel<TOPK_CAPACITY><<<blocks, threads, 0, stream>>>(
+        buffers.d_keys, buffers.d_values, group_size, topk, group_offset, group_count,
+        buffers.d_out_keys, buffers.d_out_values);
+}
+
+// Select the smallest local-array specialization that can contain the requested top-k.
+static void launch_insertion_range(
+    const DeviceBuffers& buffers,
+    int group_size,
+    int topk,
+    int group_offset,
+    int group_count,
+    cudaStream_t stream = 0) {
+    if (topk <= 1) {
+        launch_parallel_insertion_with_capacity<1>(
+            buffers, group_size, topk, group_offset, group_count, 256, stream);
+    } else if (topk <= 4) {
+        launch_parallel_insertion_with_capacity<4>(
+            buffers, group_size, topk, group_offset, group_count, 256, stream);
+    } else if (topk <= 8) {
+        launch_parallel_insertion_with_capacity<8>(
+            buffers, group_size, topk, group_offset, group_count, 128, stream);
+    } else if (topk <= 16) {
+        launch_parallel_insertion_with_capacity<16>(
+            buffers, group_size, topk, group_offset, group_count, 64, stream);
+    } else if (topk <= 32) {
+        launch_parallel_insertion_with_capacity<32>(
+            buffers, group_size, topk, group_offset, group_count, 32, stream);
+    } else if (topk <= 64) {
+        launch_parallel_insertion_with_capacity<64>(
+            buffers, group_size, topk, group_offset, group_count, 16, stream);
+    } else {
+        launch_parallel_insertion_with_capacity<GPU_SORT_MAX_TOPK>(
+            buffers, group_size, topk, group_offset, group_count, 8, stream);
+    }
+}
+
 // Execute and validate the insertion-based segmented GPU top-k path.
 BenchResult run_gpu_insertion(
     const Options& opt,
@@ -157,9 +207,7 @@ BenchResult run_gpu_insertion(
     for (int r = 0; r < opt.repeats; ++r) {
         CUDA_CHECK(cudaDeviceSynchronize());
         double start = now_ms();
-        segmented_insertion_topk_kernel<<<opt.groups, 32>>>(
-            buffers.d_keys, buffers.d_values, opt.group_size, opt.topk, 0,
-            buffers.d_out_keys, buffers.d_out_values);
+        launch_insertion_range(buffers, opt.group_size, opt.topk, 0, opt.groups);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         best_ms = std::min(best_ms, now_ms() - start);
@@ -303,9 +351,8 @@ static void launch_adaptive_range(
     int group_count,
     cudaStream_t stream = 0) {
     if (group_size <= 64 || topk <= 8) {
-        segmented_insertion_topk_kernel<<<group_count, 32, 0, stream>>>(
-            buffers.d_keys, buffers.d_values, group_size, topk, group_offset,
-            buffers.d_out_keys, buffers.d_out_values);
+        launch_insertion_range(
+            buffers, group_size, topk, group_offset, group_count, stream);
     } else {
         launch_bitonic_range(buffers, group_size, topk, group_offset, group_count, stream);
     }

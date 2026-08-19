@@ -20,7 +20,7 @@ struct Options {
     int groups = 1024;
     int group_size = 128;
     int topk = 16;
-    int streams = 1;
+    int streams = 4;
     int repeats = 1;
     int seed = 1234;
     bool profile_cpu = false;

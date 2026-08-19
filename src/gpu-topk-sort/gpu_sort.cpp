@@ -379,11 +379,33 @@ static void print_compaction_plan(const Options& opt) {
               << " candidate pairs after sorting\n";
 }
 
+// Describe how segmented rows are split into independent sort tasks.
+static void print_task_partition_summary(const Options& opt) {
+    int partitions = std::max(1, std::min(opt.streams, opt.groups));
+    int groups_per_partition = (opt.groups + partitions - 1) / partitions;
+    std::cout << "Task partition summary: " << partitions
+              << " partitions, up to " << groups_per_partition
+              << " groups per partition\n";
+}
+
+// Describe the stream count used for asynchronous task scheduling.
+static void print_stream_plan(const Options& opt) {
+    int active_streams = std::max(1, std::min(opt.streams, opt.groups));
+    std::cout << "Stream plan: use up to " << active_streams
+              << " CUDA streams for independent sort partitions\n";
+}
+
+// Document how repeated asynchronous timings are reported.
+static void print_async_timing_policy(const Options& opt) {
+    std::cout << "Async timing policy: report the best of " << opt.repeats
+              << " synchronized scheduler runs\n";
+}
+
 // Drive input loading, reference generation, optional GPU paths, and reporting.
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
-        std::cout << "GPU sorting benchmark: Adaptive small-vs-medium sort dispatcher\n";
+        std::cout << "GPU sorting benchmark: Scheduler completion and event synchronization\n";
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams
                   << " repeats=" << opt.repeats << "\n";
@@ -451,6 +473,14 @@ int run_gpu_sort_demo(int argc, char** argv) {
 #if GPU_SORT_HAS_CUDA
         std::cout << "Adaptive dispatcher selected " << (use_insertion_path(opt) ? "insertion" : "bitonic") << " for this workload.\n";
         results.push_back(run_gpu_adaptive(opt, keys, values, cpu_keys, cpu_values));
+#endif
+        std::cout << "Task model: one segmented sort request per graph candidate batch.\n";
+        print_task_partition_summary(opt);
+        print_stream_plan(opt);
+        print_async_timing_policy(opt);
+
+#if GPU_SORT_HAS_CUDA
+        results.push_back(run_gpu_scheduler(opt, keys, values, cpu_keys, cpu_values));
         results.push_back(run_gpu_end_to_end(opt, keys, values, cpu_keys, cpu_values));
 #endif
 

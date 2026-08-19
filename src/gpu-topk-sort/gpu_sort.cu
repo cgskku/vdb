@@ -391,8 +391,91 @@ BenchResult run_gpu_adaptive(
     return {"gpu_adaptive_segmented_topk", best_ms, ok};
 }
 
+// Describe a contiguous group range that can be scheduled independently.
+struct SortRequest {
+    int group_offset = 0;
+    int group_count = 0;
+    int group_size = 0;
+    int topk = 0;
+};
 
-// Measure one complete adaptive request from device preparation through host output.
+// Split segmented rows into near-even requests for asynchronous scheduling.
+static std::vector<SortRequest> make_even_requests(const Options& opt) {
+    int chunks = std::max(1, std::min(opt.streams, opt.groups));
+    std::vector<SortRequest> requests;
+    int base = 0;
+    for (int i = 0; i < chunks; ++i) {
+        int remaining = opt.groups - base;
+        int take = (remaining + (chunks - i) - 1) / (chunks - i);
+        requests.push_back({base, take, opt.group_size, opt.topk});
+        base += take;
+    }
+    return requests;
+}
+
+// Manage non-blocking CUDA streams used by scheduled sort requests.
+class StreamPool {
+public:
+    explicit StreamPool(int count) : streams_(std::max(1, count)) {
+        for (auto& stream : streams_) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        }
+    }
+    ~StreamPool() {
+        for (auto stream : streams_) {
+            cudaStreamDestroy(stream);
+        }
+    }
+    cudaStream_t get(int index) const { return streams_[static_cast<size_t>(index) % streams_.size()]; }
+    void synchronize() const {
+        for (auto stream : streams_) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+    }
+private:
+    std::vector<cudaStream_t> streams_;
+};
+
+// Execute adaptive sort requests over multiple CUDA streams and validate output.
+BenchResult run_gpu_scheduler(
+    const Options& opt,
+    const std::vector<float>& keys,
+    const std::vector<int>& values,
+    const std::vector<float>& ref_keys,
+    const std::vector<int>& ref_values,
+    std::vector<float>* final_keys,
+    std::vector<int>* final_values) {
+    DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
+    auto requests = make_even_requests(opt);
+    double best_ms = std::numeric_limits<double>::infinity();
+    for (int r = 0; r < opt.repeats; ++r) {
+        StreamPool pool(opt.streams);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double start = now_ms();
+        for (size_t i = 0; i < requests.size(); ++i) {
+            const auto& req = requests[i];
+            launch_adaptive_range(buffers, req.group_size, req.topk, req.group_offset, req.group_count, pool.get(static_cast<int>(i)));
+        }
+        CUDA_CHECK(cudaGetLastError());
+        pool.synchronize();
+        best_ms = std::min(best_ms, now_ms() - start);
+    }
+    std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
+    std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
+    copy_to_host(got_keys, buffers.d_out_keys);
+    copy_to_host(got_values, buffers.d_out_values);
+    bool ok = validate_topk(ref_keys, ref_values, got_keys, got_values, opt.groups, opt.topk);
+    if (final_keys) {
+        *final_keys = got_keys;
+    }
+    if (final_values) {
+        *final_values = got_values;
+    }
+    return {"gpu_async_scheduler_topk", best_ms, ok};
+}
+
+
+// Measure one complete scheduled request from device preparation through host output.
 BenchResult run_gpu_end_to_end(
     const Options& opt,
     const std::vector<float>& keys,
@@ -401,13 +484,20 @@ BenchResult run_gpu_end_to_end(
     const std::vector<int>& ref_values) {
     double best_ms = std::numeric_limits<double>::infinity();
     bool best_valid = false;
+    auto requests = make_even_requests(opt);
     for (int r = 0; r < opt.repeats; ++r) {
         double start = now_ms();
         DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
         CUDA_CHECK(cudaDeviceSynchronize());
-        launch_adaptive_range(buffers, opt.group_size, opt.topk, 0, opt.groups);
+        StreamPool pool(opt.streams);
+        for (size_t i = 0; i < requests.size(); ++i) {
+            const auto& req = requests[i];
+            launch_adaptive_range(
+                buffers, req.group_size, req.topk, req.group_offset,
+                req.group_count, pool.get(static_cast<int>(i)));
+        }
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        pool.synchronize();
         std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
         std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
         copy_to_host(got_keys, buffers.d_out_keys);

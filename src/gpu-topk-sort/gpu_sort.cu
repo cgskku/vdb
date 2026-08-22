@@ -474,6 +474,37 @@ BenchResult run_gpu_scheduler(
     return {"gpu_async_scheduler_topk", best_ms, ok};
 }
 
+// Reject distance-tile inputs that do not match the configured row layout.
+static void validate_distance_tile_input(
+    const Options& opt,
+    const std::vector<float>& tile_distances,
+    const std::vector<int>& candidate_ids) {
+    const size_t expected_count = static_cast<size_t>(opt.groups) * opt.group_size;
+    if (tile_distances.size() != expected_count || candidate_ids.size() != expected_count) {
+        throw std::invalid_argument(
+            "distance tile and candidate ids must contain groups * group_size elements");
+    }
+}
+
+// Adapt row-wise distance tiles into the same segmented top-k scheduler path.
+BenchResult run_distance_tile_topk_adapter(
+    const Options& opt,
+    const std::vector<float>& tile_distances,
+    const std::vector<int>& candidate_ids,
+    std::vector<float>& out_keys,
+    std::vector<int>& out_values) {
+    validate_distance_tile_input(opt, tile_distances, candidate_ids);
+    std::vector<float> ref_keys;
+    std::vector<int> ref_values;
+    cpu_segmented_topk(
+        tile_distances, candidate_ids, opt.groups, opt.group_size, opt.topk,
+        ref_keys, ref_values);
+    BenchResult result = run_gpu_scheduler(
+        opt, tile_distances, candidate_ids, ref_keys, ref_values,
+        &out_keys, &out_values);
+    result.name = "gpu_distance_tile_topk_adapter";
+    return result;
+}
 
 // Measure one complete scheduled request from device preparation through host output.
 BenchResult run_gpu_end_to_end(
@@ -510,6 +541,23 @@ BenchResult run_gpu_end_to_end(
         }
     }
     return {"gpu_end_to_end", best_ms, best_valid};
+}
+
+// Measure the complete host-to-host distance-tile adapter execution.
+BenchResult run_distance_tile_topk_adapter_end_to_end(
+    const Options& opt,
+    const std::vector<float>& tile_distances,
+    const std::vector<int>& candidate_ids) {
+    validate_distance_tile_input(opt, tile_distances, candidate_ids);
+    std::vector<float> ref_keys;
+    std::vector<int> ref_values;
+    cpu_segmented_topk(
+        tile_distances, candidate_ids, opt.groups, opt.group_size, opt.topk,
+        ref_keys, ref_values);
+    BenchResult result = run_gpu_end_to_end(
+        opt, tile_distances, candidate_ids, ref_keys, ref_values);
+    result.name = "gpu_distance_tile_adapter_total";
+    return result;
 }
 
 #endif

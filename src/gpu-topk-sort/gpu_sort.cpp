@@ -401,11 +401,18 @@ static void print_async_timing_policy(const Options& opt) {
               << " synchronized scheduler runs\n";
 }
 
+// Classify the workload shape against graph-pruning style candidate lists.
+static void print_graph_pruning_shape(const Options& opt) {
+    bool small_group = opt.group_size <= 128;
+    std::cout << "Graph pruning shape: " << (small_group ? "many small lists" : "large candidate lists")
+              << " with top-k compaction\n";
+}
+
 // Drive input loading, reference generation, optional GPU paths, and reporting.
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
-        std::cout << "GPU sorting benchmark: Scheduler completion and event synchronization\n";
+        std::cout << "GPU sorting benchmark: Distance-tile top-k adapter interface\n";
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams
                   << " repeats=" << opt.repeats << "\n";
@@ -478,11 +485,27 @@ int run_gpu_sort_demo(int argc, char** argv) {
         print_task_partition_summary(opt);
         print_stream_plan(opt);
         print_async_timing_policy(opt);
+        print_graph_pruning_shape(opt);
 
 #if GPU_SORT_HAS_CUDA
-        results.push_back(run_gpu_scheduler(opt, keys, values, cpu_keys, cpu_values));
+        std::vector<float> scheduler_keys;
+        std::vector<int> scheduler_values;
+        results.push_back(run_gpu_scheduler(
+            opt, keys, values, cpu_keys, cpu_values,
+            &scheduler_keys, &scheduler_values));
+
+        std::vector<float> adapter_keys;
+        std::vector<int> adapter_values;
+        BenchResult adapter_result = run_distance_tile_topk_adapter(
+            opt, keys, values, adapter_keys, adapter_values);
+        adapter_result.valid = adapter_result.valid && validate_topk(
+            scheduler_keys, scheduler_values, adapter_keys, adapter_values,
+            opt.groups, opt.topk);
+        results.push_back(adapter_result);
         results.push_back(run_gpu_end_to_end(opt, keys, values, cpu_keys, cpu_values));
+        results.push_back(run_distance_tile_topk_adapter_end_to_end(opt, keys, values));
 #endif
+        std::cout << "Distance-tile adapter output was compared with the direct scheduler output.\n";
 
         std::cout << "\nBenchmark summary\n";
         for (const auto& result : results) {

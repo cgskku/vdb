@@ -67,7 +67,8 @@ BenchResult run_gpu_bitonic(const Options& opt, const std::vector<float>& keys, 
 bool use_insertion_path(const Options& opt);
 BenchResult run_gpu_adaptive(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
 BenchResult run_gpu_scheduler(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
-BenchResult run_distance_tile_topk_adapter(const Options& opt, const std::vector<float>& tile_distances, std::vector<float>& out_keys, std::vector<int>& out_values);
+BenchResult run_distance_tile_topk_adapter(const Options& opt, const std::vector<float>& tile_distances, const std::vector<int>& candidate_ids, std::vector<float>& out_keys, std::vector<int>& out_values);
+BenchResult run_distance_tile_topk_adapter_end_to_end(const Options& opt, const std::vector<float>& tile_distances, const std::vector<int>& candidate_ids);
 #endif
 
 int run_gpu_sort_demo(int argc, char** argv);

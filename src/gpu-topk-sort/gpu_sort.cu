@@ -506,6 +506,24 @@ BenchResult run_distance_tile_topk_adapter(
     return result;
 }
 
+// Measure the complete host-to-host distance-tile adapter execution.
+BenchResult run_distance_tile_topk_adapter_end_to_end(
+    const Options& opt,
+    const std::vector<float>& tile_distances,
+    const std::vector<int>& candidate_ids) {
+    validate_distance_tile_input(opt, tile_distances, candidate_ids);
+    std::vector<float> ref_keys;
+    std::vector<int> ref_values;
+    cpu_segmented_topk(
+        tile_distances, candidate_ids, opt.groups, opt.group_size, opt.topk,
+        ref_keys, ref_values);
+    BenchResult result = run_gpu_end_to_end(
+        opt, tile_distances, candidate_ids, ref_keys, ref_values);
+    result.name = "gpu_distance_tile_adapter_total";
+    return result;
+}
+
+
 // Measure one complete scheduled request from device preparation through host output.
 BenchResult run_gpu_end_to_end(
     const Options& opt,
@@ -541,23 +559,6 @@ BenchResult run_gpu_end_to_end(
         }
     }
     return {"gpu_end_to_end", best_ms, best_valid};
-}
-
-// Measure the complete host-to-host distance-tile adapter execution.
-BenchResult run_distance_tile_topk_adapter_end_to_end(
-    const Options& opt,
-    const std::vector<float>& tile_distances,
-    const std::vector<int>& candidate_ids) {
-    validate_distance_tile_input(opt, tile_distances, candidate_ids);
-    std::vector<float> ref_keys;
-    std::vector<int> ref_values;
-    cpu_segmented_topk(
-        tile_distances, candidate_ids, opt.groups, opt.group_size, opt.topk,
-        ref_keys, ref_values);
-    BenchResult result = run_gpu_end_to_end(
-        opt, tile_distances, candidate_ids, ref_keys, ref_values);
-    result.name = "gpu_distance_tile_adapter_total";
-    return result;
 }
 
 #endif

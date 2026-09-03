@@ -408,11 +408,23 @@ static void print_graph_pruning_shape(const Options& opt) {
               << " with top-k compaction\n";
 }
 
+// Describe how distance-tile rows feed row-wise top-k extraction.
+static void print_distance_tile_flow(const Options& opt) {
+    std::cout << "Distance tile flow: " << opt.groups
+              << " rows feed row-wise top-k without full distance-matrix output\n";
+}
+
+// Print the current adaptive dispatch inputs for insertion or bitonic paths.
+static void print_dispatch_thresholds(const Options& opt) {
+    std::cout << "Dispatch thresholds: insertion for small k/group, bitonic for larger groups; current group_size="
+              << opt.group_size << " topk=" << opt.topk << "\n";
+}
+
 // Drive input loading, reference generation, optional GPU paths, and reporting.
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
-        std::cout << "GPU sorting benchmark: Distance-tile top-k adapter interface\n";
+        std::cout << "GPU sorting benchmark: Large-group fallback and threshold tuning\n";
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams
                   << " repeats=" << opt.repeats << "\n";
@@ -506,6 +518,8 @@ int run_gpu_sort_demo(int argc, char** argv) {
         results.push_back(run_distance_tile_topk_adapter_end_to_end(opt, keys, values));
 #endif
         std::cout << "Distance-tile adapter output was compared with the direct scheduler output.\n";
+        print_distance_tile_flow(opt);
+        print_dispatch_thresholds(opt);
 
         std::cout << "\nBenchmark summary\n";
         for (const auto& result : results) {

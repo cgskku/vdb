@@ -424,7 +424,7 @@ static void print_dispatch_thresholds(const Options& opt) {
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
-        std::cout << "GPU sorting benchmark: Large-group fallback and threshold tuning\n";
+        std::cout << "GPU sorting benchmark: OpenAI embedding workload presets\n";
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams
                   << " repeats=" << opt.repeats << "\n";
@@ -520,6 +520,7 @@ int run_gpu_sort_demo(int argc, char** argv) {
         std::cout << "Distance-tile adapter output was compared with the direct scheduler output.\n";
         print_distance_tile_flow(opt);
         print_dispatch_thresholds(opt);
+        std::cout << "OpenAI embedding preset note: use row-wise top-k on GEMM distance tiles from 1536-dim shards.\n";
 
         std::cout << "\nBenchmark summary\n";
         for (const auto& result : results) {

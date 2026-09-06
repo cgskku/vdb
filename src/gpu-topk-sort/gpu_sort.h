@@ -17,11 +17,11 @@
 
 // Runtime options that define the segmented top-k workload.
 struct Options {
-    int groups = 1024;
+    int groups = 4096;
     int group_size = 128;
-    int topk = 16;
+    int topk = 32;
     int streams = 4;
-    int repeats = 1;
+    int repeats = 3;
     int seed = 1234;
     bool profile_cpu = false;
     std::string keys_bin_path;

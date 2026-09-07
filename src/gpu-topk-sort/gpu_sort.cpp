@@ -19,7 +19,7 @@
 void print_usage(const char* prog) {
     std::cout << "Usage: " << prog
               << " [--groups N] [--group-size N] [--topk K] [--streams N] [--repeats N]"
-              << " [--keys-bin path] [--values-bin path] [--profile-cpu]\n";
+              << " [--csv path] [--keys-bin path] [--values-bin path] [--profile-cpu]\n";
 }
 
 // Parse command-line options and normalize invalid benchmark values early.
@@ -47,6 +47,9 @@ Options parse_options(int argc, char** argv) {
         }
         else if (arg == "--repeats") {
             opt.repeats = std::atoi(need_value("--repeats"));
+        }
+        else if (arg == "--csv") {
+            opt.csv_path = need_value("--csv");
         }
         else if (arg == "--keys-bin") {
             opt.keys_bin_path = need_value("--keys-bin");
@@ -342,6 +345,22 @@ void print_cpu_profile(const CpuPhaseProfile& best, const CpuPhaseProfile& avg) 
               << avg.total_ms << " ms avg\n";
 }
 
+// Append benchmark rows in a stable CSV format for experiment tracking.
+void write_csv_summary(const std::string& path, const Options& opt, const std::vector<BenchResult>& results) {
+    if (path.empty()) {
+        return;
+    }
+    std::ofstream out(path, std::ios::app);
+    if (out.tellp() == 0) {
+        out << "groups,group_size,topk,streams,repeats,name,milliseconds,valid\n";
+    }
+    for (const auto& r : results) {
+        out << opt.groups << ',' << opt.group_size << ',' << opt.topk << ','
+            << opt.streams << ',' << opt.repeats << ',' << r.name << ','
+            << std::fixed << std::setprecision(6) << r.milliseconds << ',' << (r.valid ? 1 : 0) << '\n';
+    }
+}
+
 // Summarize the flat segmented workload shape before running benchmarks.
 static void print_workload_layout(const Options& opt) {
     size_t candidates = static_cast<size_t>(opt.groups) * opt.group_size;
@@ -420,11 +439,18 @@ static void print_dispatch_thresholds(const Options& opt) {
               << opt.group_size << " topk=" << opt.topk << "\n";
 }
 
+// Show where benchmark CSV rows will be written when enabled.
+static void print_csv_output_plan(const Options& opt) {
+    if (!opt.csv_path.empty()) {
+        std::cout << "CSV output: append benchmark rows to " << opt.csv_path << "\n";
+    }
+}
+
 // Drive input loading, reference generation, optional GPU paths, and reporting.
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
-        std::cout << "GPU sorting benchmark: OpenAI embedding workload presets\n";
+        std::cout << "GPU sorting benchmark: CSV benchmark logging\n";
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams
                   << " repeats=" << opt.repeats << "\n";
@@ -520,6 +546,7 @@ int run_gpu_sort_demo(int argc, char** argv) {
         std::cout << "Distance-tile adapter output was compared with the direct scheduler output.\n";
         print_distance_tile_flow(opt);
         print_dispatch_thresholds(opt);
+        print_csv_output_plan(opt);
         std::cout << "OpenAI embedding preset note: use row-wise top-k on GEMM distance tiles from 1536-dim shards.\n";
 
         std::cout << "\nBenchmark summary\n";
@@ -529,6 +556,7 @@ int run_gpu_sort_demo(int argc, char** argv) {
                       << result.milliseconds << " ms"
                       << " valid=" << (result.valid ? "yes" : "no") << "\n";
         }
+        write_csv_summary(opt.csv_path, opt, results);
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";

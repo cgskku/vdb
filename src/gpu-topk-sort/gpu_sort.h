@@ -24,6 +24,7 @@ struct Options {
     int repeats = 3;
     int seed = 1234;
     bool profile_cpu = false;
+    std::string csv_path;
     std::string keys_bin_path;
     std::string values_bin_path;
 };
@@ -57,6 +58,7 @@ CpuPhaseProfile cpu_segmented_topk_profiled(const std::vector<float>& keys, cons
 bool validate_topk(const std::vector<float>& ref_keys, const std::vector<int>& ref_values, const std::vector<float>& got_keys, const std::vector<int>& got_values, int groups, int topk, float eps = 1e-4f);
 void print_first_group(const std::vector<float>& keys, const std::vector<int>& values, int topk);
 void print_cpu_profile(const CpuPhaseProfile& best, const CpuPhaseProfile& avg);
+void write_csv_summary(const std::string& path, const Options& opt, const std::vector<BenchResult>& results);
 
 // CUDA entrypoints are declared only when the runtime headers are available.
 #if GPU_SORT_HAS_CUDA

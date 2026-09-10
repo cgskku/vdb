@@ -59,6 +59,8 @@ bool validate_topk(const std::vector<float>& ref_keys, const std::vector<int>& r
 void print_first_group(const std::vector<float>& keys, const std::vector<int>& values, int topk);
 void print_cpu_profile(const CpuPhaseProfile& best, const CpuPhaseProfile& avg);
 void write_csv_summary(const std::string& path, const Options& opt, const std::vector<BenchResult>& results);
+void write_neighbor_list_preview(const std::string& path, const std::vector<float>& keys, const std::vector<int>& values, int groups, int topk);
+void print_transfer_reduction(const Options& opt);
 
 // CUDA entrypoints are declared only when the runtime headers are available.
 #if GPU_SORT_HAS_CUDA

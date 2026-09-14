@@ -194,6 +194,29 @@ static void launch_insertion_range(
 }
 
 // Execute and validate the insertion-based segmented GPU top-k path.
+// CUDA events measure the device interval; host timing remains a separate metric.
+class KernelTimer {
+public:
+    KernelTimer() {
+        CUDA_CHECK(cudaEventCreate(&start_));
+        CUDA_CHECK(cudaEventCreate(&stop_));
+    }
+    ~KernelTimer() {
+        cudaEventDestroy(stop_);
+        cudaEventDestroy(start_);
+    }
+    void start() { CUDA_CHECK(cudaEventRecord(start_)); }
+    void stop() { CUDA_CHECK(cudaEventRecord(stop_)); }
+    double elapsed() {
+        CUDA_CHECK(cudaEventSynchronize(stop_));
+        float milliseconds = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_, stop_));
+        return milliseconds;
+    }
+private:
+    cudaEvent_t start_, stop_;
+};
+
 BenchResult run_gpu_insertion(
     const Options& opt,
     const std::vector<float>& keys,
@@ -204,13 +227,18 @@ BenchResult run_gpu_insertion(
     std::vector<int>* final_values) {
     DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
     double best_ms = std::numeric_limits<double>::infinity();
+    double best_kernel_ms = std::numeric_limits<double>::infinity();
+    KernelTimer timer;
     for (int r = 0; r < opt.repeats; ++r) {
         CUDA_CHECK(cudaDeviceSynchronize());
         double start = now_ms();
+        timer.start();
         launch_insertion_range(buffers, opt.group_size, opt.topk, 0, opt.groups);
         CUDA_CHECK(cudaGetLastError());
+        timer.stop();
         CUDA_CHECK(cudaDeviceSynchronize());
         best_ms = std::min(best_ms, now_ms() - start);
+        best_kernel_ms = std::min(best_kernel_ms, timer.elapsed());
     }
     std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
     std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
@@ -223,7 +251,7 @@ BenchResult run_gpu_insertion(
     if (final_values) {
         *final_values = got_values;
     }
-    return {"gpu_insertion_segmented_topk", best_ms, ok};
+    return {"gpu_insertion_segmented_topk", best_ms, ok, best_kernel_ms};
 }
 
 // Sort one group per block in shared memory with a bitonic network.
@@ -315,13 +343,18 @@ BenchResult run_gpu_bitonic(
     std::vector<int>* final_values) {
     DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
     double best_ms = std::numeric_limits<double>::infinity();
+    double best_kernel_ms = std::numeric_limits<double>::infinity();
+    KernelTimer timer;
     for (int r = 0; r < opt.repeats; ++r) {
         CUDA_CHECK(cudaDeviceSynchronize());
         double start = now_ms();
+        timer.start();
         launch_bitonic_range(buffers, opt.group_size, opt.topk, 0, opt.groups);
         CUDA_CHECK(cudaGetLastError());
+        timer.stop();
         CUDA_CHECK(cudaDeviceSynchronize());
         best_ms = std::min(best_ms, now_ms() - start);
+        best_kernel_ms = std::min(best_kernel_ms, timer.elapsed());
     }
     std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
     std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
@@ -334,7 +367,7 @@ BenchResult run_gpu_bitonic(
     if (final_values) {
         *final_values = got_values;
     }
-    return {"gpu_bitonic_segmented_topk", best_ms, ok};
+    return {"gpu_bitonic_segmented_topk", best_ms, ok, best_kernel_ms};
 }
 
 // Choose the cheaper insertion path for small groups or very small k.
@@ -369,13 +402,18 @@ BenchResult run_gpu_adaptive(
     std::vector<int>* final_values) {
     DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
     double best_ms = std::numeric_limits<double>::infinity();
+    double best_kernel_ms = std::numeric_limits<double>::infinity();
+    KernelTimer timer;
     for (int r = 0; r < opt.repeats; ++r) {
         CUDA_CHECK(cudaDeviceSynchronize());
         double start = now_ms();
+        timer.start();
         launch_adaptive_range(buffers, opt.group_size, opt.topk, 0, opt.groups);
         CUDA_CHECK(cudaGetLastError());
+        timer.stop();
         CUDA_CHECK(cudaDeviceSynchronize());
         best_ms = std::min(best_ms, now_ms() - start);
+        best_kernel_ms = std::min(best_kernel_ms, timer.elapsed());
     }
     std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
     std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
@@ -388,7 +426,7 @@ BenchResult run_gpu_adaptive(
     if (final_values) {
         *final_values = got_values;
     }
-    return {"gpu_adaptive_segmented_topk", best_ms, ok};
+    return {"gpu_adaptive_segmented_topk", best_ms, ok, best_kernel_ms};
 }
 
 // Describe a contiguous group range that can be scheduled independently.
@@ -474,6 +512,56 @@ BenchResult run_gpu_scheduler(
     return {"gpu_async_scheduler_topk", best_ms, ok};
 }
 
+// Measure allocation, host transfers, scheduled kernels, and validation output separately.
+PipelineTiming run_gpu_scheduler_pipeline(
+    const Options& opt,
+    const std::vector<float>& keys,
+    const std::vector<int>& values,
+    const std::vector<float>& ref_keys,
+    const std::vector<int>& ref_values) {
+    PipelineTiming best;
+    best.total_ms = std::numeric_limits<double>::infinity();
+    auto requests = make_even_requests(opt);
+
+    for (int r = 0; r < opt.repeats; ++r) {
+        double total_start = now_ms();
+        double h2d_start = now_ms();
+        DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double h2d_ms = now_ms() - h2d_start;
+
+        StreamPool pool(opt.streams);
+        double kernel_start = now_ms();
+        for (size_t i = 0; i < requests.size(); ++i) {
+            const auto& req = requests[i];
+            launch_adaptive_range(
+                buffers, req.group_size, req.topk, req.group_offset,
+                req.group_count, pool.get(static_cast<int>(i)));
+        }
+        CUDA_CHECK(cudaGetLastError());
+        pool.synchronize();
+        double kernel_ms = now_ms() - kernel_start;
+
+        std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
+        std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
+        double d2h_start = now_ms();
+        copy_to_host(got_keys, buffers.d_out_keys);
+        copy_to_host(got_values, buffers.d_out_values);
+        double d2h_ms = now_ms() - d2h_start;
+        double total_ms = now_ms() - total_start;
+
+        if (total_ms < best.total_ms) {
+            best.h2d_ms = h2d_ms;
+            best.kernel_ms = kernel_ms;
+            best.d2h_ms = d2h_ms;
+            best.total_ms = total_ms;
+            best.valid = validate_topk(
+                ref_keys, ref_values, got_keys, got_values, opt.groups, opt.topk);
+        }
+    }
+    return best;
+}
+
 // Reject distance-tile inputs that do not match the configured row layout.
 static void validate_distance_tile_input(
     const Options& opt,
@@ -517,48 +605,9 @@ BenchResult run_distance_tile_topk_adapter_end_to_end(
     cpu_segmented_topk(
         tile_distances, candidate_ids, opt.groups, opt.group_size, opt.topk,
         ref_keys, ref_values);
-    BenchResult result = run_gpu_end_to_end(
+    PipelineTiming pipeline = run_gpu_scheduler_pipeline(
         opt, tile_distances, candidate_ids, ref_keys, ref_values);
-    result.name = "gpu_distance_tile_adapter_total";
-    return result;
-}
-
-
-// Measure one complete scheduled request from device preparation through host output.
-BenchResult run_gpu_end_to_end(
-    const Options& opt,
-    const std::vector<float>& keys,
-    const std::vector<int>& values,
-    const std::vector<float>& ref_keys,
-    const std::vector<int>& ref_values) {
-    double best_ms = std::numeric_limits<double>::infinity();
-    bool best_valid = false;
-    auto requests = make_even_requests(opt);
-    for (int r = 0; r < opt.repeats; ++r) {
-        double start = now_ms();
-        DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        StreamPool pool(opt.streams);
-        for (size_t i = 0; i < requests.size(); ++i) {
-            const auto& req = requests[i];
-            launch_adaptive_range(
-                buffers, req.group_size, req.topk, req.group_offset,
-                req.group_count, pool.get(static_cast<int>(i)));
-        }
-        CUDA_CHECK(cudaGetLastError());
-        pool.synchronize();
-        std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
-        std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
-        copy_to_host(got_keys, buffers.d_out_keys);
-        copy_to_host(got_values, buffers.d_out_values);
-        double elapsed = now_ms() - start;
-        if (elapsed < best_ms) {
-            best_ms = elapsed;
-            best_valid = validate_topk(
-                ref_keys, ref_values, got_keys, got_values, opt.groups, opt.topk);
-        }
-    }
-    return {"gpu_end_to_end", best_ms, best_valid};
+    return {"gpu_distance_tile_adapter_total", pipeline.total_ms, pipeline.valid};
 }
 
 #endif

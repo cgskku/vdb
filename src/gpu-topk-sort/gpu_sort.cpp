@@ -156,7 +156,7 @@ std::vector<int> load_or_make_values(const Options& opt) {
 
 // Return a millisecond timestamp for lightweight benchmark timing.
 double now_ms() {
-    using clock = std::chrono::high_resolution_clock;
+    using clock = std::chrono::steady_clock;
     return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
 }
 
@@ -272,7 +272,7 @@ bool validate_topk(
     for (int g = 0; g < groups; ++g) {
         for (int k = 0; k < topk; ++k) {
             size_t idx = static_cast<size_t>(g) * topk + k;
-            if (std::fabs(ref_keys[idx] - got_keys[idx]) > eps || ref_values[idx] != got_values[idx]) {
+            if ((std::isnan(got_keys[idx]) || std::fabs(ref_keys[idx] - got_keys[idx]) > eps) || ref_values[idx] != got_values[idx]) {
                 std::cerr << "Mismatch at group=" << g << " k=" << k
                           << " ref=(" << ref_keys[idx] << "," << ref_values[idx]
                           << ") got=(" << got_keys[idx] << "," << got_values[idx] << ")\n";
@@ -531,9 +531,21 @@ int run_gpu_sort_demo(int argc, char** argv) {
             cpu_ms = best_profile.total_ms;
             print_cpu_profile(best_profile, avg_profile);
         } else {
-            double cpu_start = now_ms();
-            cpu_segmented_topk(keys, values, opt.groups, opt.group_size, opt.topk, cpu_keys, cpu_values);
-            cpu_ms = now_ms() - cpu_start;
+            cpu_ms = std::numeric_limits<double>::infinity();
+            for (int r = 0; r < opt.repeats; ++r) {
+                std::vector<float> run_keys;
+                std::vector<int> run_values;
+                double cpu_start = now_ms();
+                cpu_segmented_topk(
+                    keys, values, opt.groups, opt.group_size, opt.topk,
+                    run_keys, run_values);
+                double run_ms = now_ms() - cpu_start;
+                if (run_ms < cpu_ms) {
+                    cpu_ms = run_ms;
+                    cpu_keys = std::move(run_keys);
+                    cpu_values = std::move(run_values);
+                }
+            }
         }
         std::vector<BenchResult> results;
         results.push_back({"cpu_partial_sort", cpu_ms, true});
@@ -584,8 +596,15 @@ int run_gpu_sort_demo(int argc, char** argv) {
             scheduler_keys, scheduler_values, adapter_keys, adapter_values,
             opt.groups, opt.topk);
         results.push_back(adapter_result);
-        results.push_back(run_gpu_end_to_end(opt, keys, values, cpu_keys, cpu_values));
+
+        PipelineTiming pipeline = run_gpu_scheduler_pipeline(
+            opt, keys, values, cpu_keys, cpu_values);
+        results.push_back({"gpu_scheduler_end_to_end", pipeline.total_ms, pipeline.valid});
         results.push_back(run_distance_tile_topk_adapter_end_to_end(opt, keys, values));
+        std::cout << "End-to-end timing: H2D=" << pipeline.h2d_ms
+                  << " ms scheduler_submit_sync=" << pipeline.kernel_ms
+                  << " ms D2H=" << pipeline.d2h_ms
+                  << " ms total=" << pipeline.total_ms << " ms\n";
 #endif
         std::cout << "Distance-tile adapter output was compared with the direct scheduler output.\n";
         print_distance_tile_flow(opt);
@@ -608,13 +627,23 @@ int run_gpu_sort_demo(int argc, char** argv) {
 
         std::cout << "\nBenchmark summary\n";
         for (const auto& result : results) {
-            std::cout << "  " << std::left << std::setw(32) << result.name
-                      << std::right << std::fixed << std::setprecision(3)
+            std::cout << "  " << std::left << std::setw(40) << result.name
+                      << std::right << std::fixed << std::setprecision(6)
                       << result.milliseconds << " ms"
                       << " valid=" << (result.valid ? "yes" : "no") << "\n";
+            if (result.kernel_ms >= 0.0) {
+                std::cout << "  " << result.name << "_kernel_only " << result.kernel_ms << " ms\n";
+            }
         }
         write_csv_summary(opt.csv_path, opt, results);
-        return 0;
+        bool all_valid = true;
+        for (const auto& result : results) {
+            all_valid = all_valid && result.valid;
+        }
+#if GPU_SORT_HAS_CUDA
+        all_valid = all_valid && final_result.valid;
+#endif
+        return all_valid ? 0 : 1;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         print_usage(argv[0]);

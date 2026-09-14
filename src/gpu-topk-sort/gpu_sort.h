@@ -34,6 +34,16 @@ struct BenchResult {
     std::string name;
     double milliseconds = 0.0;
     bool valid = true;
+    double kernel_ms = -1.0;
+};
+
+// Separate transfer, execution, and total latency for end-to-end comparisons.
+struct PipelineTiming {
+    double h2d_ms = 0.0;
+    double kernel_ms = 0.0;
+    double d2h_ms = 0.0;
+    double total_ms = 0.0;
+    bool valid = true;
 };
 
 // Per-phase CPU timing used to identify the baseline bottleneck.
@@ -65,12 +75,12 @@ void print_transfer_reduction(const Options& opt);
 // CUDA entrypoints are declared only when the runtime headers are available.
 #if GPU_SORT_HAS_CUDA
 void run_warmup_kernel(const std::vector<float>& keys);
-BenchResult run_gpu_end_to_end(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values);
 BenchResult run_gpu_insertion(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
 BenchResult run_gpu_bitonic(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
 bool use_insertion_path(const Options& opt);
 BenchResult run_gpu_adaptive(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
 BenchResult run_gpu_scheduler(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
+PipelineTiming run_gpu_scheduler_pipeline(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values);
 BenchResult run_distance_tile_topk_adapter(const Options& opt, const std::vector<float>& tile_distances, const std::vector<int>& candidate_ids, std::vector<float>& out_keys, std::vector<int>& out_values);
 BenchResult run_distance_tile_topk_adapter_end_to_end(const Options& opt, const std::vector<float>& tile_distances, const std::vector<int>& candidate_ids);
 #endif

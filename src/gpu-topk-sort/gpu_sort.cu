@@ -97,99 +97,61 @@ void run_warmup_kernel(const std::vector<float>& keys) {
     CUDA_CHECK(cudaFree(d_tmp));
 }
 
-// Let each thread maintain the insertion top-k list for one independent group.
-template <int TOPK_CAPACITY>
-__global__ void segmented_parallel_insertion_topk_kernel(
+// Sort groups of at most 64 candidates with all lanes of one warp participating.
+__global__ void segmented_warp_micro_topk_kernel(
     const float* keys,
     const int* values,
     int group_size,
+    int padded_size,
     int topk,
     int group_offset,
-    int group_count,
     float* out_keys,
     int* out_values) {
-    int local_group = blockIdx.x * blockDim.x + threadIdx.x;
-    if (local_group >= group_count) {
-        return;
-    }
-    int group = group_offset + local_group;
+    __shared__ float shared_keys[64];
+    __shared__ int shared_values[64];
+    int lane = threadIdx.x;
+    int group = group_offset + blockIdx.x;
+    int input_base = group * group_size;
 
-    float best_keys[TOPK_CAPACITY];
-    int best_values[TOPK_CAPACITY];
-    for (int k = 0; k < topk; ++k) {
-        best_keys[k] = INFINITY;
-        best_values[k] = -1;
-    }
-
-    const int base = group * group_size;
-    for (int i = 0; i < group_size; ++i) {
-        float key = keys[base + i];
-        int value = values[base + i];
-        if (key > best_keys[topk - 1] || (key == best_keys[topk - 1] && value >= best_values[topk - 1])) {
-            continue;
+    for (int i = lane; i < padded_size; i += 32) {
+        if (i < group_size) {
+            shared_keys[i] = keys[input_base + i];
+            shared_values[i] = values[input_base + i];
+        } else {
+            shared_keys[i] = INFINITY;
+            shared_values[i] = -1;
         }
-        int pos = topk - 1;
-        while (pos > 0 && (key < best_keys[pos - 1] || (key == best_keys[pos - 1] && value < best_values[pos - 1]))) {
-            best_keys[pos] = best_keys[pos - 1];
-            best_values[pos] = best_values[pos - 1];
-            --pos;
+    }
+    __syncwarp();
+
+    for (int sequence = 2; sequence <= padded_size; sequence <<= 1) {
+        for (int stride = sequence >> 1; stride > 0; stride >>= 1) {
+            for (int i = lane; i < padded_size; i += 32) {
+                int peer = i ^ stride;
+                if (peer > i) {
+                    bool ascending = (i & sequence) == 0;
+                    float a = shared_keys[i];
+                    float b = shared_keys[peer];
+                    int av = shared_values[i];
+                    int bv = shared_values[peer];
+                    bool greater = (a > b) || (a == b && av > bv);
+                    bool less = (a < b) || (a == b && av < bv);
+                    if (ascending ? greater : less) {
+                        shared_keys[i] = b;
+                        shared_keys[peer] = a;
+                        shared_values[i] = bv;
+                        shared_values[peer] = av;
+                    }
+                }
+            }
+            __syncwarp();
         }
-        best_keys[pos] = key;
-        best_values[pos] = value;
     }
 
-    const int out_base = group * topk;
-    for (int k = 0; k < topk; ++k) {
-        out_keys[out_base + k] = best_keys[k];
-        out_values[out_base + k] = best_values[k];
-    }
-}
-
-// Limit threads as the per-thread top-k state grows to avoid excessive register pressure.
-template <int TOPK_CAPACITY>
-static void launch_parallel_insertion_with_capacity(
-    const DeviceBuffers& buffers,
-    int group_size,
-    int topk,
-    int group_offset,
-    int group_count,
-    int threads,
-    cudaStream_t stream) {
-    int blocks = (group_count + threads - 1) / threads;
-    segmented_parallel_insertion_topk_kernel<TOPK_CAPACITY><<<blocks, threads, 0, stream>>>(
-        buffers.d_keys, buffers.d_values, group_size, topk, group_offset, group_count,
-        buffers.d_out_keys, buffers.d_out_values);
-}
-
-// Select the smallest local-array specialization that can contain the requested top-k.
-static void launch_insertion_range(
-    const DeviceBuffers& buffers,
-    int group_size,
-    int topk,
-    int group_offset,
-    int group_count,
-    cudaStream_t stream = 0) {
-    if (topk <= 1) {
-        launch_parallel_insertion_with_capacity<1>(
-            buffers, group_size, topk, group_offset, group_count, 256, stream);
-    } else if (topk <= 4) {
-        launch_parallel_insertion_with_capacity<4>(
-            buffers, group_size, topk, group_offset, group_count, 256, stream);
-    } else if (topk <= 8) {
-        launch_parallel_insertion_with_capacity<8>(
-            buffers, group_size, topk, group_offset, group_count, 128, stream);
-    } else if (topk <= 16) {
-        launch_parallel_insertion_with_capacity<16>(
-            buffers, group_size, topk, group_offset, group_count, 64, stream);
-    } else if (topk <= 32) {
-        launch_parallel_insertion_with_capacity<32>(
-            buffers, group_size, topk, group_offset, group_count, 32, stream);
-    } else if (topk <= 64) {
-        launch_parallel_insertion_with_capacity<64>(
-            buffers, group_size, topk, group_offset, group_count, 16, stream);
-    } else {
-        launch_parallel_insertion_with_capacity<GPU_SORT_MAX_TOPK>(
-            buffers, group_size, topk, group_offset, group_count, 8, stream);
+    int output_base = group * topk;
+    for (int i = lane; i < topk; i += 32) {
+        out_keys[output_base + i] = shared_keys[i];
+        out_values[output_base + i] = shared_values[i];
     }
 }
 
@@ -225,7 +187,11 @@ BenchResult run_gpu_insertion(
     const std::vector<int>& ref_values,
     std::vector<float>* final_keys,
     std::vector<int>* final_values) {
+    if (opt.group_size > 64) {
+        throw std::runtime_error("warp micro-sort supports group_size <= 64");
+    }
     DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
+    int padded_size = next_power_of_two(opt.group_size);
     double best_ms = std::numeric_limits<double>::infinity();
     double best_kernel_ms = std::numeric_limits<double>::infinity();
     KernelTimer timer;
@@ -233,7 +199,9 @@ BenchResult run_gpu_insertion(
         CUDA_CHECK(cudaDeviceSynchronize());
         double start = now_ms();
         timer.start();
-        launch_insertion_range(buffers, opt.group_size, opt.topk, 0, opt.groups);
+        segmented_warp_micro_topk_kernel<<<opt.groups, 32>>>(
+            buffers.d_keys, buffers.d_values, opt.group_size, padded_size, opt.topk, 0,
+            buffers.d_out_keys, buffers.d_out_values);
         CUDA_CHECK(cudaGetLastError());
         timer.stop();
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -251,7 +219,7 @@ BenchResult run_gpu_insertion(
     if (final_values) {
         *final_values = got_values;
     }
-    return {"gpu_insertion_segmented_topk", best_ms, ok, best_kernel_ms};
+    return {"gpu_warp_micro_topk", best_ms, ok, best_kernel_ms};
 }
 
 // Sort one group per block in shared memory with a bitonic network.
@@ -372,7 +340,7 @@ BenchResult run_gpu_bitonic(
 
 // Choose the cheaper insertion path for small groups or very small k.
 bool use_insertion_path(const Options& opt) {
-    return opt.group_size <= 64 || opt.topk <= 8;
+    return opt.group_size <= 64;
 }
 
 // Dispatch each group range to insertion or bitonic sorting based on workload shape.
@@ -383,9 +351,11 @@ static void launch_adaptive_range(
     int group_offset,
     int group_count,
     cudaStream_t stream = 0) {
-    if (group_size <= 64 || topk <= 8) {
-        launch_insertion_range(
-            buffers, group_size, topk, group_offset, group_count, stream);
+    if (group_size <= 64) {
+        segmented_warp_micro_topk_kernel<<<group_count, 32, 0, stream>>>(
+            buffers.d_keys, buffers.d_values, group_size,
+            next_power_of_two(group_size), topk, group_offset,
+            buffers.d_out_keys, buffers.d_out_values);
     } else {
         launch_bitonic_range(buffers, group_size, topk, group_offset, group_count, stream);
     }

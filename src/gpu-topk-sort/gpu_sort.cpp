@@ -562,7 +562,9 @@ int run_gpu_sort_demo(int argc, char** argv) {
 #endif
 
 #if GPU_SORT_HAS_CUDA
-        results.push_back(run_gpu_insertion(opt, keys, values, cpu_keys, cpu_values));
+        if (opt.group_size <= 64) {
+            results.push_back(run_gpu_insertion(opt, keys, values, cpu_keys, cpu_values));
+        }
 #endif
 
 #if GPU_SORT_HAS_CUDA
@@ -572,7 +574,7 @@ int run_gpu_sort_demo(int argc, char** argv) {
 #endif
 
 #if GPU_SORT_HAS_CUDA
-        std::cout << "Adaptive dispatcher selected " << (use_insertion_path(opt) ? "insertion" : "bitonic") << " for this workload.\n";
+        std::cout << "Adaptive dispatcher selected " << (use_insertion_path(opt) ? "warp micro-sort" : "bitonic") << " for this workload.\n";
         results.push_back(run_gpu_adaptive(opt, keys, values, cpu_keys, cpu_values));
 #endif
         std::cout << "Task model: one segmented sort request per graph candidate batch.\n";

@@ -570,11 +570,16 @@ int run_gpu_sort_demo(int argc, char** argv) {
 #if GPU_SORT_HAS_CUDA
         if (opt.group_size <= 1024) {
             results.push_back(run_gpu_bitonic(opt, keys, values, cpu_keys, cpu_values));
+        } else {
+            results.push_back(run_gpu_segmented_radix(opt, keys, values, cpu_keys, cpu_values));
         }
 #endif
 
 #if GPU_SORT_HAS_CUDA
-        std::cout << "Adaptive dispatcher selected " << (use_insertion_path(opt) ? "warp micro-sort" : "bitonic") << " for this workload.\n";
+        const char* selected_path = opt.group_size > 1024
+            ? "CUB segmented radix"
+            : (use_insertion_path(opt) ? "warp micro-sort" : "bitonic");
+        std::cout << "Adaptive dispatcher selected " << selected_path << " for this workload.\n";
         results.push_back(run_gpu_adaptive(opt, keys, values, cpu_keys, cpu_values));
 #endif
         std::cout << "Task model: one segmented sort request per graph candidate batch.\n";
@@ -584,31 +589,33 @@ int run_gpu_sort_demo(int argc, char** argv) {
         print_graph_pruning_shape(opt);
 
 #if GPU_SORT_HAS_CUDA
-        std::vector<float> scheduler_keys;
-        std::vector<int> scheduler_values;
-        results.push_back(run_gpu_scheduler(
-            opt, keys, values, cpu_keys, cpu_values,
-            &scheduler_keys, &scheduler_values));
+        if (opt.group_size <= 1024) {
+            std::vector<float> scheduler_keys;
+            std::vector<int> scheduler_values;
+            results.push_back(run_gpu_scheduler(
+                opt, keys, values, cpu_keys, cpu_values,
+                &scheduler_keys, &scheduler_values));
 
-        std::vector<float> adapter_keys;
-        std::vector<int> adapter_values;
-        BenchResult adapter_result = run_distance_tile_topk_adapter(
-            opt, keys, values, adapter_keys, adapter_values);
-        adapter_result.valid = adapter_result.valid && validate_topk(
-            scheduler_keys, scheduler_values, adapter_keys, adapter_values,
-            opt.groups, opt.topk);
-        results.push_back(adapter_result);
+            std::vector<float> adapter_keys;
+            std::vector<int> adapter_values;
+            BenchResult adapter_result = run_distance_tile_topk_adapter(
+                opt, keys, values, adapter_keys, adapter_values);
+            adapter_result.valid = adapter_result.valid && validate_topk(
+                scheduler_keys, scheduler_values, adapter_keys, adapter_values,
+                opt.groups, opt.topk);
+            results.push_back(adapter_result);
 
-        PipelineTiming pipeline = run_gpu_scheduler_pipeline(
-            opt, keys, values, cpu_keys, cpu_values);
-        results.push_back({"gpu_scheduler_end_to_end", pipeline.total_ms, pipeline.valid});
-        results.push_back(run_distance_tile_topk_adapter_end_to_end(opt, keys, values));
-        std::cout << "End-to-end timing: H2D=" << pipeline.h2d_ms
-                  << " ms scheduler_submit_sync=" << pipeline.kernel_ms
-                  << " ms D2H=" << pipeline.d2h_ms
-                  << " ms total=" << pipeline.total_ms << " ms\n";
+            PipelineTiming pipeline = run_gpu_scheduler_pipeline(
+                opt, keys, values, cpu_keys, cpu_values);
+            results.push_back({"gpu_scheduler_end_to_end", pipeline.total_ms, pipeline.valid});
+            results.push_back(run_distance_tile_topk_adapter_end_to_end(opt, keys, values));
+            std::cout << "End-to-end timing: H2D=" << pipeline.h2d_ms
+                      << " ms scheduler_submit_sync=" << pipeline.kernel_ms
+                      << " ms D2H=" << pipeline.d2h_ms
+                      << " ms total=" << pipeline.total_ms << " ms\n";
+        }
 #endif
-        std::cout << "Distance-tile adapter output was compared with the direct scheduler output.\n";
+        std::cout << "Distance-tile adapter output was compared with the direct scheduler output when the scheduler supports the group size.\n";
         print_distance_tile_flow(opt);
         print_dispatch_thresholds(opt);
         print_csv_output_plan(opt);
@@ -619,7 +626,9 @@ int run_gpu_sort_demo(int argc, char** argv) {
 #if GPU_SORT_HAS_CUDA
         std::vector<float> final_keys;
         std::vector<int> final_values;
-        auto final_result = run_gpu_scheduler(opt, keys, values, cpu_keys, cpu_values, &final_keys, &final_values);
+        auto final_result = opt.group_size > 1024
+            ? run_gpu_segmented_radix(opt, keys, values, cpu_keys, cpu_values, &final_keys, &final_values)
+            : run_gpu_scheduler(opt, keys, values, cpu_keys, cpu_values, &final_keys, &final_values);
         if (final_result.valid) {
             write_neighbor_list_preview("neighbor_preview.csv", final_keys, final_values, opt.groups, opt.topk);
             std::cout << "Wrote neighbor_preview.csv for the first 32 groups.\n";

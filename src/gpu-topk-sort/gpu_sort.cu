@@ -4,6 +4,7 @@
 #if GPU_SORT_HAS_CUDA
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <cub/device/device_segmented_radix_sort.cuh>
 
 #include <algorithm>
 #include <limits>
@@ -338,6 +339,125 @@ BenchResult run_gpu_bitonic(
     return {"gpu_bitonic_segmented_topk", best_ms, ok, best_kernel_ms};
 }
 
+// Convert a float and signed candidate id into one radix-sortable tie-broken key.
+__device__ unsigned long long encode_sort_key(float key, int value) {
+    unsigned int bits = __float_as_uint(key == 0.0f ? 0.0f : key);
+    unsigned int ordered_key = bits ^ ((bits & 0x80000000u) ? 0xffffffffu : 0x80000000u);
+    unsigned int ordered_value = static_cast<unsigned int>(value) ^ 0x80000000u;
+    return (static_cast<unsigned long long>(ordered_key) << 32) | ordered_value;
+}
+
+// Encode every input pair before the segmented radix sort.
+__global__ void encode_sort_pairs_kernel(
+    const float* keys,
+    const int* values,
+    unsigned long long* encoded,
+    size_t count) {
+    size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) {
+        encoded[index] = encode_sort_key(keys[index], values[index]);
+    }
+}
+
+// Decode only the first top-k entries from each fully sorted radix segment.
+__global__ void compact_radix_topk_kernel(
+    const unsigned long long* sorted_keys,
+    const int* sorted_values,
+    int groups,
+    int group_size,
+    int topk,
+    float* out_keys,
+    int* out_values) {
+    size_t output_index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    size_t output_count = static_cast<size_t>(groups) * topk;
+    if (output_index >= output_count) {
+        return;
+    }
+    int group = static_cast<int>(output_index / topk);
+    int rank = static_cast<int>(output_index % topk);
+    size_t sorted_index = static_cast<size_t>(group) * group_size + rank;
+    unsigned int ordered = static_cast<unsigned int>(sorted_keys[sorted_index] >> 32);
+    unsigned int bits = ordered ^ ((ordered & 0x80000000u) ? 0x80000000u : 0xffffffffu);
+    out_keys[output_index] = __uint_as_float(bits);
+    out_values[output_index] = sorted_values[sorted_index];
+}
+
+// Use CUB segmented radix sort when one block cannot hold an entire group.
+BenchResult run_gpu_segmented_radix(
+    const Options& opt,
+    const std::vector<float>& keys,
+    const std::vector<int>& values,
+    const std::vector<float>& ref_keys,
+    const std::vector<int>& ref_values,
+    std::vector<float>* final_keys,
+    std::vector<int>* final_values) {
+    DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
+    size_t count = keys.size();
+    auto* d_encoded = device_alloc<unsigned long long>(count);
+    auto* d_sorted_keys = device_alloc<unsigned long long>(count);
+    auto* d_sorted_values = device_alloc<int>(count);
+    auto* d_offsets = device_alloc<int>(static_cast<size_t>(opt.groups) + 1);
+    std::vector<int> offsets(static_cast<size_t>(opt.groups) + 1);
+    for (int group = 0; group <= opt.groups; ++group) {
+        offsets[group] = group * opt.group_size;
+    }
+    copy_to_device(d_offsets, offsets);
+
+    void* d_temp_storage = nullptr;
+    size_t temp_storage_bytes = 0;
+    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+        d_temp_storage, temp_storage_bytes, d_encoded, d_sorted_keys,
+        buffers.d_values, d_sorted_values, static_cast<int>(count), opt.groups,
+        d_offsets, d_offsets + 1));
+    CUDA_CHECK(cudaMalloc(&d_temp_storage, temp_storage_bytes));
+
+    double best_ms = std::numeric_limits<double>::infinity();
+    double best_kernel_ms = std::numeric_limits<double>::infinity();
+    KernelTimer timer;
+    for (int r = 0; r < opt.repeats; ++r) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double start = now_ms();
+        timer.start();
+        int threads = 256;
+        int encode_blocks = static_cast<int>((count + threads - 1) / threads);
+        encode_sort_pairs_kernel<<<encode_blocks, threads>>>(
+            buffers.d_keys, buffers.d_values, d_encoded, count);
+        CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+            d_temp_storage, temp_storage_bytes, d_encoded, d_sorted_keys,
+            buffers.d_values, d_sorted_values, static_cast<int>(count), opt.groups,
+            d_offsets, d_offsets + 1));
+        size_t output_count = static_cast<size_t>(opt.groups) * opt.topk;
+        int compact_blocks = static_cast<int>((output_count + threads - 1) / threads);
+        compact_radix_topk_kernel<<<compact_blocks, threads>>>(
+            d_sorted_keys, d_sorted_values, opt.groups, opt.group_size, opt.topk,
+            buffers.d_out_keys, buffers.d_out_values);
+        CUDA_CHECK(cudaGetLastError());
+        timer.stop();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        best_ms = std::min(best_ms, now_ms() - start);
+        best_kernel_ms = std::min(best_kernel_ms, timer.elapsed());
+    }
+
+    std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
+    std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
+    copy_to_host(got_keys, buffers.d_out_keys);
+    copy_to_host(got_values, buffers.d_out_values);
+    bool ok = validate_topk(
+        ref_keys, ref_values, got_keys, got_values, opt.groups, opt.topk);
+    if (final_keys) {
+        *final_keys = got_keys;
+    }
+    if (final_values) {
+        *final_values = got_values;
+    }
+    cudaFree(d_temp_storage);
+    cudaFree(d_offsets);
+    cudaFree(d_sorted_values);
+    cudaFree(d_sorted_keys);
+    cudaFree(d_encoded);
+    return {"gpu_cub_segmented_radix_topk", best_ms, ok, best_kernel_ms};
+}
+
 // Choose the cheaper insertion path for small groups or very small k.
 bool use_insertion_path(const Options& opt) {
     return opt.group_size <= 64;
@@ -370,6 +490,10 @@ BenchResult run_gpu_adaptive(
     const std::vector<int>& ref_values,
     std::vector<float>* final_keys,
     std::vector<int>* final_values) {
+    if (opt.group_size > 1024) {
+        return run_gpu_segmented_radix(
+            opt, keys, values, ref_keys, ref_values, final_keys, final_values);
+    }
     DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
     double best_ms = std::numeric_limits<double>::infinity();
     double best_kernel_ms = std::numeric_limits<double>::infinity();

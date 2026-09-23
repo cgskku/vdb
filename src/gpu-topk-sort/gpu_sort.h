@@ -24,6 +24,8 @@ struct Options {
     int repeats = 3;
     int seed = 1234;
     bool profile_cpu = false;
+    bool heterogeneous = false;
+    int requests = 10;
     std::string csv_path;
     std::string keys_bin_path;
     std::string values_bin_path;
@@ -43,6 +45,31 @@ struct PipelineTiming {
     double kernel_ms = 0.0;
     double d2h_ms = 0.0;
     double total_ms = 0.0;
+    bool valid = true;
+};
+
+// Locate one independent segmented request in packed input and output arrays.
+struct SortRequestDescriptor {
+    size_t input_offset = 0;
+    size_t output_offset = 0;
+    int groups = 0;
+    int group_size = 0;
+    int topk = 0;
+};
+
+// Hold variable-shape requests in contiguous host buffers for transfer and scheduling.
+struct PackedSortWorkload {
+    std::vector<float> keys;
+    std::vector<int> values;
+    std::vector<float> reference_keys;
+    std::vector<int> reference_values;
+    std::vector<SortRequestDescriptor> requests;
+};
+
+// Compare one-stream submission with cost-balanced multi-stream submission.
+struct SchedulerComparison {
+    double sequential_ms = 0.0;
+    double asynchronous_ms = 0.0;
     bool valid = true;
 };
 
@@ -71,6 +98,7 @@ void print_cpu_profile(const CpuPhaseProfile& best, const CpuPhaseProfile& avg);
 void write_csv_summary(const std::string& path, const Options& opt, const std::vector<BenchResult>& results);
 void write_neighbor_list_preview(const std::string& path, const std::vector<float>& keys, const std::vector<int>& values, int groups, int topk);
 void print_transfer_reduction(const Options& opt);
+PackedSortWorkload make_heterogeneous_workload(const Options& opt);
 
 // CUDA entrypoints are declared only when the runtime headers are available.
 #if GPU_SORT_HAS_CUDA
@@ -82,6 +110,8 @@ bool use_insertion_path(const Options& opt);
 BenchResult run_gpu_adaptive(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
 BenchResult run_gpu_scheduler(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
 PipelineTiming run_gpu_scheduler_pipeline(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values);
+BenchResult run_gpu_heterogeneous_sequential(const Options& opt, const PackedSortWorkload& workload);
+SchedulerComparison run_gpu_heterogeneous_scheduler(const Options& opt, const PackedSortWorkload& workload);
 BenchResult run_distance_tile_topk_adapter(const Options& opt, const std::vector<float>& tile_distances, const std::vector<int>& candidate_ids, std::vector<float>& out_keys, std::vector<int>& out_values);
 BenchResult run_distance_tile_topk_adapter_end_to_end(const Options& opt, const std::vector<float>& tile_distances, const std::vector<int>& candidate_ids);
 #endif

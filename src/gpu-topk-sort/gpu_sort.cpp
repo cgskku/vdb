@@ -19,7 +19,8 @@
 void print_usage(const char* prog) {
     std::cout << "Usage: " << prog
               << " [--groups N] [--group-size N] [--topk K] [--streams N] [--repeats N]"
-              << " [--csv path] [--keys-bin path] [--values-bin path] [--profile-cpu]\n";
+              << " [--csv path] [--keys-bin path] [--values-bin path] [--profile-cpu]"
+              << " [--heterogeneous] [--requests N]\n";
 }
 
 // Parse command-line options and normalize invalid benchmark values early.
@@ -60,6 +61,12 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--profile-cpu") {
             opt.profile_cpu = true;
         }
+        else if (arg == "--heterogeneous") {
+            opt.heterogeneous = true;
+        }
+        else if (arg == "--requests") {
+            opt.requests = std::atoi(need_value("--requests"));
+        }
         else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             std::exit(0);
@@ -83,7 +90,64 @@ Options parse_options(int argc, char** argv) {
     if (opt.repeats <= 0) {
         opt.repeats = 1;
     }
+    if (opt.requests <= 0) {
+        throw std::runtime_error("requests must be positive");
+    }
     return opt;
+}
+
+// Generate repeatable graph-build request shapes ranging from micro lists to large expansions.
+PackedSortWorkload make_heterogeneous_workload(const Options& opt) {
+    struct Shape {
+        int groups;
+        int group_size;
+        int topk;
+    };
+    const Shape shapes[] = {
+        {64, 32, 8}, {32, 64, 16}, {16, 128, 32},
+        {8, 512, 32}, {4, 2048, 32}
+    };
+
+    PackedSortWorkload workload;
+    std::mt19937 rng(static_cast<unsigned>(opt.seed));
+    std::uniform_real_distribution<float> distance(0.0f, 2.0f);
+    size_t input_offset = 0;
+    size_t output_offset = 0;
+    int candidate_id = 0;
+
+    for (int request_index = 0; request_index < opt.requests; ++request_index) {
+        const Shape& shape = shapes[request_index % 5];
+        workload.requests.push_back({
+            input_offset, output_offset, shape.groups, shape.group_size, shape.topk});
+        size_t input_count = static_cast<size_t>(shape.groups) * shape.group_size;
+        size_t output_count = static_cast<size_t>(shape.groups) * shape.topk;
+        size_t old_size = workload.keys.size();
+        workload.keys.resize(old_size + input_count);
+        workload.values.resize(old_size + input_count);
+        for (size_t i = 0; i < input_count; ++i) {
+            workload.keys[old_size + i] = distance(rng);
+            workload.values[old_size + i] = candidate_id++;
+        }
+
+        std::vector<float> request_keys(
+            workload.keys.begin() + static_cast<std::ptrdiff_t>(input_offset),
+            workload.keys.begin() + static_cast<std::ptrdiff_t>(input_offset + input_count));
+        std::vector<int> request_values(
+            workload.values.begin() + static_cast<std::ptrdiff_t>(input_offset),
+            workload.values.begin() + static_cast<std::ptrdiff_t>(input_offset + input_count));
+        std::vector<float> request_reference_keys;
+        std::vector<int> request_reference_values;
+        cpu_segmented_topk(
+            request_keys, request_values, shape.groups, shape.group_size, shape.topk,
+            request_reference_keys, request_reference_values);
+        workload.reference_keys.insert(
+            workload.reference_keys.end(), request_reference_keys.begin(), request_reference_keys.end());
+        workload.reference_values.insert(
+            workload.reference_values.end(), request_reference_values.begin(), request_reference_values.end());
+        input_offset += input_count;
+        output_offset += output_count;
+    }
+    return workload;
 }
 
 // Generate deterministic distance keys for repeatable local benchmarks.
@@ -494,6 +558,32 @@ static void print_evaluation_readiness(const Options& opt) {
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
+        if (opt.heterogeneous) {
+            PackedSortWorkload workload = make_heterogeneous_workload(opt);
+            std::cout << "Heterogeneous request benchmark: requests=" << workload.requests.size()
+                      << " input_pairs=" << workload.keys.size()
+                      << " output_pairs=" << workload.reference_keys.size() << "\n";
+#if GPU_SORT_HAS_CUDA
+            BenchResult result = run_gpu_heterogeneous_sequential(opt, workload);
+            std::cout << "  " << result.name << " " << std::fixed << std::setprecision(6)
+                      << result.milliseconds << " ms valid="
+                      << (result.valid ? "yes" : "no") << "\n";
+            if (result.kernel_ms >= 0.0) {
+                std::cout << "  " << result.name << "_kernel_only " << result.kernel_ms << " ms\n";
+            }
+            SchedulerComparison comparison = run_gpu_heterogeneous_scheduler(opt, workload);
+            std::cout << "  packed_one_stream " << comparison.sequential_ms << " ms\n"
+                      << "  packed_async_scheduler " << comparison.asynchronous_ms << " ms\n"
+                      << "  scheduler_speedup "
+                      << comparison.sequential_ms / comparison.asynchronous_ms << "x\n"
+                      << "  scheduler_validation "
+                      << (comparison.valid ? "pass" : "fail") << "\n";
+            return result.valid && comparison.valid ? 0 : 1;
+#else
+            std::cout << "CUDA runtime was not available at build time.\n";
+            return 0;
+#endif
+        }
         std::cout << "GPU sorting benchmark: segmented top-k module\n";
         std::cout << "groups=" << opt.groups << " group_size=" << opt.group_size
                   << " topk=" << opt.topk << " streams=" << opt.streams

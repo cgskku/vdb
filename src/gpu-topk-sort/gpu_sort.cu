@@ -7,7 +7,10 @@
 #include <cub/device/device_segmented_radix_sort.cuh>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
+#include <memory>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 
@@ -654,6 +657,237 @@ PipelineTiming run_gpu_scheduler_pipeline(
         }
     }
     return best;
+}
+
+// Establish a correctness and latency baseline by executing variable requests one at a time.
+BenchResult run_gpu_heterogeneous_sequential(
+    const Options& opt,
+    const PackedSortWorkload& workload) {
+    double best_ms = std::numeric_limits<double>::infinity();
+    bool valid = true;
+    for (int repeat = 0; repeat < opt.repeats; ++repeat) {
+        double start = now_ms();
+        bool repeat_valid = true;
+        for (const auto& request : workload.requests) {
+            size_t input_count = static_cast<size_t>(request.groups) * request.group_size;
+            size_t output_count = static_cast<size_t>(request.groups) * request.topk;
+            std::vector<float> keys(
+                workload.keys.begin() + static_cast<std::ptrdiff_t>(request.input_offset),
+                workload.keys.begin() + static_cast<std::ptrdiff_t>(request.input_offset + input_count));
+            std::vector<int> values(
+                workload.values.begin() + static_cast<std::ptrdiff_t>(request.input_offset),
+                workload.values.begin() + static_cast<std::ptrdiff_t>(request.input_offset + input_count));
+            std::vector<float> reference_keys(
+                workload.reference_keys.begin() + static_cast<std::ptrdiff_t>(request.output_offset),
+                workload.reference_keys.begin() + static_cast<std::ptrdiff_t>(request.output_offset + output_count));
+            std::vector<int> reference_values(
+                workload.reference_values.begin() + static_cast<std::ptrdiff_t>(request.output_offset),
+                workload.reference_values.begin() + static_cast<std::ptrdiff_t>(request.output_offset + output_count));
+            Options request_options = opt;
+            request_options.groups = request.groups;
+            request_options.group_size = request.group_size;
+            request_options.topk = request.topk;
+            request_options.repeats = 1;
+            BenchResult result = run_gpu_adaptive(
+                request_options, keys, values, reference_keys, reference_values);
+            repeat_valid = repeat_valid && result.valid;
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double elapsed = now_ms() - start;
+        if (elapsed < best_ms) {
+            best_ms = elapsed;
+            valid = repeat_valid;
+        }
+    }
+    return {"gpu_heterogeneous_sequential", best_ms, valid};
+}
+
+// Own one packed input allocation and its compact variable-size output allocation.
+struct PackedDeviceBuffers {
+    float* d_keys = nullptr;
+    int* d_values = nullptr;
+    float* d_out_keys = nullptr;
+    int* d_out_values = nullptr;
+
+    explicit PackedDeviceBuffers(const PackedSortWorkload& workload) {
+        d_keys = device_alloc<float>(workload.keys.size());
+        d_values = device_alloc<int>(workload.values.size());
+        d_out_keys = device_alloc<float>(workload.reference_keys.size());
+        d_out_values = device_alloc<int>(workload.reference_values.size());
+        copy_to_device(d_keys, workload.keys);
+        copy_to_device(d_values, workload.values);
+    }
+
+    ~PackedDeviceBuffers() {
+        cudaFree(d_keys);
+        cudaFree(d_values);
+        cudaFree(d_out_keys);
+        cudaFree(d_out_values);
+    }
+};
+
+// Reserve independent CUB storage for a large request that may overlap other streams.
+struct RadixRequestWorkspace {
+    unsigned long long* d_encoded = nullptr;
+    unsigned long long* d_sorted_keys = nullptr;
+    int* d_sorted_values = nullptr;
+    int* d_offsets = nullptr;
+    void* d_temp_storage = nullptr;
+    size_t temp_storage_bytes = 0;
+
+    explicit RadixRequestWorkspace(const SortRequestDescriptor& request) {
+        size_t count = static_cast<size_t>(request.groups) * request.group_size;
+        d_encoded = device_alloc<unsigned long long>(count);
+        d_sorted_keys = device_alloc<unsigned long long>(count);
+        d_sorted_values = device_alloc<int>(count);
+        d_offsets = device_alloc<int>(static_cast<size_t>(request.groups) + 1);
+        std::vector<int> offsets(static_cast<size_t>(request.groups) + 1);
+        for (int group = 0; group <= request.groups; ++group) {
+            offsets[group] = group * request.group_size;
+        }
+        copy_to_device(d_offsets, offsets);
+        CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+            d_temp_storage, temp_storage_bytes, d_encoded, d_sorted_keys,
+            static_cast<const int*>(nullptr), d_sorted_values,
+            static_cast<int>(count), request.groups, d_offsets, d_offsets + 1));
+        CUDA_CHECK(cudaMalloc(&d_temp_storage, temp_storage_bytes));
+    }
+
+    ~RadixRequestWorkspace() {
+        cudaFree(d_temp_storage);
+        cudaFree(d_offsets);
+        cudaFree(d_sorted_values);
+        cudaFree(d_sorted_keys);
+        cudaFree(d_encoded);
+    }
+};
+
+// Assign requests to the currently least-loaded stream using an n log n cost estimate.
+static std::vector<int> assign_request_streams(
+    const PackedSortWorkload& workload,
+    int stream_count) {
+    stream_count = std::max(1, stream_count);
+    std::vector<double> loads(static_cast<size_t>(stream_count), 0.0);
+    std::vector<int> assignments(workload.requests.size(), 0);
+    for (size_t i = 0; i < workload.requests.size(); ++i) {
+        const auto& request = workload.requests[i];
+        int stream = static_cast<int>(
+            std::min_element(loads.begin(), loads.end()) - loads.begin());
+        assignments[i] = stream;
+        double candidates = static_cast<double>(request.groups) * request.group_size;
+        loads[stream] += candidates * (std::log2(static_cast<double>(request.group_size)) + 1.0);
+    }
+    return assignments;
+}
+
+// Launch one variable-shape request without reallocating or copying its packed input.
+static void launch_packed_request(
+    const PackedDeviceBuffers& buffers,
+    const SortRequestDescriptor& request,
+    RadixRequestWorkspace* radix,
+    cudaStream_t stream) {
+    const float* request_keys = buffers.d_keys + request.input_offset;
+    const int* request_values = buffers.d_values + request.input_offset;
+    float* request_out_keys = buffers.d_out_keys + request.output_offset;
+    int* request_out_values = buffers.d_out_values + request.output_offset;
+
+    if (request.group_size <= 64) {
+        segmented_warp_micro_topk_kernel<<<request.groups, 32, 0, stream>>>(
+            request_keys, request_values, request.group_size,
+            next_power_of_two(request.group_size), request.topk, 0,
+            request_out_keys, request_out_values);
+        return;
+    }
+    if (request.group_size <= 1024) {
+        int threads = next_power_of_two(request.group_size);
+        size_t shared_bytes = static_cast<size_t>(threads) * (sizeof(float) + sizeof(int));
+        segmented_bitonic_topk_kernel<<<request.groups, threads, shared_bytes, stream>>>(
+            request_keys, request_values, request.group_size, request.topk, 0,
+            request_out_keys, request_out_values);
+        return;
+    }
+
+    size_t count = static_cast<size_t>(request.groups) * request.group_size;
+    int threads = 256;
+    int encode_blocks = static_cast<int>((count + threads - 1) / threads);
+    encode_sort_pairs_kernel<<<encode_blocks, threads, 0, stream>>>(
+        request_keys, request_values, radix->d_encoded, count);
+    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+        radix->d_temp_storage, radix->temp_storage_bytes,
+        radix->d_encoded, radix->d_sorted_keys,
+        request_values, radix->d_sorted_values,
+        static_cast<int>(count), request.groups,
+        radix->d_offsets, radix->d_offsets + 1, 0, 64, stream));
+    size_t output_count = static_cast<size_t>(request.groups) * request.topk;
+    int compact_blocks = static_cast<int>((output_count + threads - 1) / threads);
+    compact_radix_topk_kernel<<<compact_blocks, threads, 0, stream>>>(
+        radix->d_sorted_keys, radix->d_sorted_values,
+        request.groups, request.group_size, request.topk,
+        request_out_keys, request_out_values);
+}
+
+// Compare serialized and cost-balanced submissions on the same resident device buffers.
+SchedulerComparison run_gpu_heterogeneous_scheduler(
+    const Options& opt,
+    const PackedSortWorkload& workload) {
+    PackedDeviceBuffers buffers(workload);
+    StreamPool pool(opt.streams);
+    std::vector<std::unique_ptr<RadixRequestWorkspace>> radix_workspaces;
+    radix_workspaces.reserve(workload.requests.size());
+    for (const auto& request : workload.requests) {
+        if (request.group_size > 1024) {
+            radix_workspaces.push_back(std::make_unique<RadixRequestWorkspace>(request));
+        } else {
+            radix_workspaces.push_back(nullptr);
+        }
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<int> assignments = assign_request_streams(workload, opt.streams);
+
+    bool policies_valid = true;
+    auto measure = [&](bool asynchronous) {
+        double best_ms = std::numeric_limits<double>::infinity();
+        for (int repeat = 0; repeat < opt.repeats; ++repeat) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemset(buffers.d_out_values, 0xff,
+                workload.reference_values.size() * sizeof(int)));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            double start = now_ms();
+            for (size_t i = 0; i < workload.requests.size(); ++i) {
+                int stream_index = asynchronous ? assignments[i] : 0;
+                launch_packed_request(
+                    buffers, workload.requests[i], radix_workspaces[i].get(),
+                    pool.get(stream_index));
+            }
+            CUDA_CHECK(cudaGetLastError());
+            pool.synchronize();
+            best_ms = std::min(best_ms, now_ms() - start);
+            std::vector<float> checked_keys(workload.reference_keys.size());
+            std::vector<int> checked_values(workload.reference_values.size());
+            copy_to_host(checked_keys, buffers.d_out_keys);
+            copy_to_host(checked_values, buffers.d_out_values);
+            policies_valid = validate_topk(workload.reference_keys, workload.reference_values,
+                checked_keys, checked_values, 1, static_cast<int>(checked_keys.size())) && policies_valid;
+        }
+        return best_ms;
+    };
+
+    SchedulerComparison comparison;
+    comparison.sequential_ms = measure(false);
+    comparison.asynchronous_ms = measure(true);
+    std::vector<float> got_keys(workload.reference_keys.size());
+    std::vector<int> got_values(workload.reference_values.size());
+    copy_to_host(got_keys, buffers.d_out_keys);
+    copy_to_host(got_values, buffers.d_out_values);
+    comparison.valid = policies_valid;
+    for (size_t i = 0; i < got_keys.size(); ++i) {
+        if (std::fabs(got_keys[i] - workload.reference_keys[i]) > 1e-4f ||
+            got_values[i] != workload.reference_values[i]) {
+            comparison.valid = false;
+            break;
+        }
+    }
+    return comparison;
 }
 
 // Reject distance-tile inputs that do not match the configured row layout.

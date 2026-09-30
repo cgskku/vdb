@@ -780,30 +780,24 @@ static std::vector<int> assign_request_streams(
     return assignments;
 }
 
-// Launch one variable-shape request without reallocating or copying its packed input.
-static void launch_packed_request(
-    const PackedDeviceBuffers& buffers,
-    const SortRequestDescriptor& request,
+// Launch one caller-owned device request on the selected CUDA stream.
+static void launch_device_request(
+    const DeviceTopkRequest& request,
     RadixRequestWorkspace* radix,
     cudaStream_t stream) {
-    const float* request_keys = buffers.d_keys + request.input_offset;
-    const int* request_values = buffers.d_values + request.input_offset;
-    float* request_out_keys = buffers.d_out_keys + request.output_offset;
-    int* request_out_values = buffers.d_out_values + request.output_offset;
-
     if (request.group_size <= 64) {
         segmented_warp_micro_topk_kernel<<<request.groups, 32, 0, stream>>>(
-            request_keys, request_values, request.group_size,
+            request.keys, request.values, request.group_size,
             next_power_of_two(request.group_size), request.topk, 0,
-            request_out_keys, request_out_values);
+            request.out_keys, request.out_values);
         return;
     }
     if (request.group_size <= 1024) {
         int threads = next_power_of_two(request.group_size);
         size_t shared_bytes = static_cast<size_t>(threads) * (sizeof(float) + sizeof(int));
         segmented_bitonic_topk_kernel<<<request.groups, threads, shared_bytes, stream>>>(
-            request_keys, request_values, request.group_size, request.topk, 0,
-            request_out_keys, request_out_values);
+            request.keys, request.values, request.group_size, request.topk, 0,
+            request.out_keys, request.out_values);
         return;
     }
 
@@ -811,11 +805,11 @@ static void launch_packed_request(
     int threads = 256;
     int encode_blocks = static_cast<int>((count + threads - 1) / threads);
     encode_sort_pairs_kernel<<<encode_blocks, threads, 0, stream>>>(
-        request_keys, request_values, radix->d_encoded, count);
+        request.keys, request.values, radix->d_encoded, count);
     CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
         radix->d_temp_storage, radix->temp_storage_bytes,
         radix->d_encoded, radix->d_sorted_keys,
-        request_values, radix->d_sorted_values,
+        request.values, radix->d_sorted_values,
         static_cast<int>(count), request.groups,
         radix->d_offsets, radix->d_offsets + 1, 0, 64, stream));
     size_t output_count = static_cast<size_t>(request.groups) * request.topk;
@@ -823,7 +817,80 @@ static void launch_packed_request(
     compact_radix_topk_kernel<<<compact_blocks, threads, 0, stream>>>(
         radix->d_sorted_keys, radix->d_sorted_values,
         request.groups, request.group_size, request.topk,
-        request_out_keys, request_out_values);
+        request.out_keys, request.out_values);
+}
+
+// Translate offsets in a packed workload into the public device-pointer request contract.
+static void launch_packed_request(
+    const PackedDeviceBuffers& buffers,
+    const SortRequestDescriptor& request,
+    RadixRequestWorkspace* radix,
+    cudaStream_t stream) {
+    DeviceTopkRequest device_request;
+    device_request.keys = buffers.d_keys + request.input_offset;
+    device_request.values = buffers.d_values + request.input_offset;
+    device_request.out_keys = buffers.d_out_keys + request.output_offset;
+    device_request.out_values = buffers.d_out_values + request.output_offset;
+    device_request.groups = request.groups;
+    device_request.group_size = request.group_size;
+    device_request.topk = request.topk;
+    launch_device_request(device_request, radix, stream);
+}
+
+// Keep stream load and per-request radix storage behind the public C++ API.
+struct GpuTopkScheduler::Impl {
+    explicit Impl(int stream_count)
+        : pool(std::max(1, stream_count)),
+          loads(static_cast<size_t>(std::max(1, stream_count)), 0.0) {}
+
+    StreamPool pool;
+    std::vector<double> loads;
+    std::vector<std::unique_ptr<RadixRequestWorkspace>> pending_radix;
+};
+
+GpuTopkScheduler::GpuTopkScheduler(int stream_count)
+    : impl_(new Impl(stream_count)) {}
+
+GpuTopkScheduler::~GpuTopkScheduler() {
+    if (impl_) {
+        try {
+            impl_->pool.synchronize();
+        } catch (...) {
+        }
+        delete impl_;
+    }
+}
+
+void GpuTopkScheduler::submit(const DeviceTopkRequest& request) {
+    if (!request.keys || !request.values || !request.out_keys || !request.out_values) {
+        throw std::runtime_error("device top-k request contains a null pointer");
+    }
+    if (request.groups <= 0 || request.group_size <= 0 || request.topk <= 0 ||
+        request.topk > request.group_size || request.topk > GPU_SORT_MAX_TOPK) {
+        throw std::runtime_error("device top-k request has an invalid shape");
+    }
+    int stream_index = static_cast<int>(
+        std::min_element(impl_->loads.begin(), impl_->loads.end()) - impl_->loads.begin());
+    RadixRequestWorkspace* radix = nullptr;
+    if (request.group_size > 1024) {
+        SortRequestDescriptor descriptor;
+        descriptor.groups = request.groups;
+        descriptor.group_size = request.group_size;
+        descriptor.topk = request.topk;
+        impl_->pending_radix.push_back(
+            std::make_unique<RadixRequestWorkspace>(descriptor));
+        radix = impl_->pending_radix.back().get();
+    }
+    launch_device_request(request, radix, impl_->pool.get(stream_index));
+    double candidates = static_cast<double>(request.groups) * request.group_size;
+    impl_->loads[stream_index] +=
+        candidates * (std::log2(static_cast<double>(request.group_size)) + 1.0);
+}
+
+void GpuTopkScheduler::synchronize() {
+    impl_->pool.synchronize();
+    impl_->pending_radix.clear();
+    std::fill(impl_->loads.begin(), impl_->loads.end(), 0.0);
 }
 
 // Compare serialized and cost-balanced submissions on the same resident device buffers.
@@ -888,6 +955,43 @@ SchedulerComparison run_gpu_heterogeneous_scheduler(
         }
     }
     return comparison;
+}
+
+// Exercise the public API with resident distance buffers as an integration contract test.
+BenchResult run_gpu_device_api_validation(
+    const Options& opt,
+    const PackedSortWorkload& workload) {
+    PackedDeviceBuffers buffers(workload);
+    GpuTopkScheduler scheduler(opt.streams);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    double start = now_ms();
+    for (const auto& request : workload.requests) {
+        DeviceTopkRequest device_request;
+        device_request.keys = buffers.d_keys + request.input_offset;
+        device_request.values = buffers.d_values + request.input_offset;
+        device_request.out_keys = buffers.d_out_keys + request.output_offset;
+        device_request.out_values = buffers.d_out_values + request.output_offset;
+        device_request.groups = request.groups;
+        device_request.group_size = request.group_size;
+        device_request.topk = request.topk;
+        scheduler.submit(device_request);
+    }
+    scheduler.synchronize();
+    double elapsed = now_ms() - start;
+
+    std::vector<float> got_keys(workload.reference_keys.size());
+    std::vector<int> got_values(workload.reference_values.size());
+    copy_to_host(got_keys, buffers.d_out_keys);
+    copy_to_host(got_values, buffers.d_out_values);
+    bool valid = true;
+    for (size_t i = 0; i < got_keys.size(); ++i) {
+        if (std::fabs(got_keys[i] - workload.reference_keys[i]) > 1e-4f ||
+            got_values[i] != workload.reference_values[i]) {
+            valid = false;
+            break;
+        }
+    }
+    return {"gpu_device_pointer_api", elapsed, valid};
 }
 
 // Reject distance-tile inputs that do not match the configured row layout.

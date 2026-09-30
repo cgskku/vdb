@@ -102,6 +102,32 @@ PackedSortWorkload make_heterogeneous_workload(const Options& opt);
 
 // CUDA entrypoints are declared only when the runtime headers are available.
 #if GPU_SORT_HAS_CUDA
+// Describe device-resident input and output arrays owned by the caller.
+struct DeviceTopkRequest {
+    const float* keys = nullptr;
+    const int* values = nullptr;
+    float* out_keys = nullptr;
+    int* out_values = nullptr;
+    int groups = 0;
+    int group_size = 0;
+    int topk = 0;
+};
+
+// Accept independent device requests and assign them to non-blocking CUDA streams.
+class GpuTopkScheduler {
+public:
+    explicit GpuTopkScheduler(int stream_count);
+    ~GpuTopkScheduler();
+    GpuTopkScheduler(const GpuTopkScheduler&) = delete;
+    GpuTopkScheduler& operator=(const GpuTopkScheduler&) = delete;
+    void submit(const DeviceTopkRequest& request);
+    void synchronize();
+
+private:
+    struct Impl;
+    Impl* impl_ = nullptr;
+};
+
 void run_warmup_kernel(const std::vector<float>& keys);
 BenchResult run_gpu_insertion(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
 BenchResult run_gpu_bitonic(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
@@ -112,6 +138,7 @@ BenchResult run_gpu_scheduler(const Options& opt, const std::vector<float>& keys
 PipelineTiming run_gpu_scheduler_pipeline(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values);
 BenchResult run_gpu_heterogeneous_sequential(const Options& opt, const PackedSortWorkload& workload);
 SchedulerComparison run_gpu_heterogeneous_scheduler(const Options& opt, const PackedSortWorkload& workload);
+BenchResult run_gpu_device_api_validation(const Options& opt, const PackedSortWorkload& workload);
 BenchResult run_distance_tile_topk_adapter(const Options& opt, const std::vector<float>& tile_distances, const std::vector<int>& candidate_ids, std::vector<float>& out_keys, std::vector<int>& out_values);
 BenchResult run_distance_tile_topk_adapter_end_to_end(const Options& opt, const std::vector<float>& tile_distances, const std::vector<int>& candidate_ids);
 #endif

@@ -578,7 +578,10 @@ int run_gpu_sort_demo(int argc, char** argv) {
                       << comparison.sequential_ms / comparison.asynchronous_ms << "x\n"
                       << "  scheduler_validation "
                       << (comparison.valid ? "pass" : "fail") << "\n";
-            return result.valid && comparison.valid ? 0 : 1;
+            BenchResult api_result = run_gpu_device_api_validation(opt, workload);
+            std::cout << "  " << api_result.name << " " << api_result.milliseconds
+                      << " ms valid=" << (api_result.valid ? "yes" : "no") << "\n";
+            return result.valid && comparison.valid && api_result.valid ? 0 : 1;
 #else
             std::cout << "CUDA runtime was not available at build time.\n";
             return 0;

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -20,7 +21,7 @@ void print_usage(const char* prog) {
     std::cout << "Usage: " << prog
               << " [--groups N] [--group-size N] [--topk K] [--streams N] [--repeats N]"
               << " [--csv path] [--keys-bin path] [--values-bin path] [--profile-cpu]"
-              << " [--heterogeneous] [--requests N]\n";
+              << " [--heterogeneous] [--requests N] [--request-manifest path]\n";
 }
 
 // Parse command-line options and normalize invalid benchmark values early.
@@ -66,6 +67,9 @@ Options parse_options(int argc, char** argv) {
         }
         else if (arg == "--requests") {
             opt.requests = std::atoi(need_value("--requests"));
+        }
+        else if (arg == "--request-manifest") {
+            opt.request_manifest_path = need_value("--request-manifest");
         }
         else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
@@ -253,6 +257,60 @@ void cpu_segmented_topk(
             out_values[static_cast<size_t>(g) * topk + k] = row[k].second;
         }
     }
+}
+
+// Load variable request shapes and their binary distance/id arrays from a text manifest.
+PackedSortWorkload load_request_manifest(const std::string& path) {
+    std::ifstream manifest(path);
+    if (!manifest) {
+        throw std::runtime_error("failed to open request manifest: " + path);
+    }
+    std::filesystem::path base = std::filesystem::absolute(path).parent_path();
+    PackedSortWorkload workload;
+    std::string name;
+    std::string keys_path;
+    std::string values_path;
+    int groups = 0;
+    int group_size = 0;
+    int topk = 0;
+    while (manifest >> name >> keys_path >> values_path >> groups >> group_size >> topk) {
+        if (groups <= 0 || group_size <= 0 || topk <= 0 ||
+            topk > group_size || topk > GPU_SORT_MAX_TOPK) {
+            throw std::runtime_error("invalid request shape for " + name);
+        }
+        std::filesystem::path keys_file(keys_path);
+        std::filesystem::path values_file(values_path);
+        if (keys_file.is_relative()) {
+            keys_file = base / keys_file;
+        }
+        if (values_file.is_relative()) {
+            values_file = base / values_file;
+        }
+        size_t input_count = static_cast<size_t>(groups) * group_size;
+        std::vector<float> request_keys = load_binary_vector<float>(
+            keys_file.string(), input_count, "manifest keys");
+        std::vector<int> request_values = load_binary_vector<int>(
+            values_file.string(), input_count, "manifest values");
+        size_t input_offset = workload.keys.size();
+        size_t output_offset = workload.reference_keys.size();
+        workload.requests.push_back({
+            input_offset, output_offset, groups, group_size, topk});
+        workload.keys.insert(workload.keys.end(), request_keys.begin(), request_keys.end());
+        workload.values.insert(workload.values.end(), request_values.begin(), request_values.end());
+        std::vector<float> reference_keys;
+        std::vector<int> reference_values;
+        cpu_segmented_topk(
+            request_keys, request_values, groups, group_size, topk,
+            reference_keys, reference_values);
+        workload.reference_keys.insert(
+            workload.reference_keys.end(), reference_keys.begin(), reference_keys.end());
+        workload.reference_values.insert(
+            workload.reference_values.end(), reference_values.begin(), reference_values.end());
+    }
+    if (workload.requests.empty()) {
+        throw std::runtime_error("request manifest contains no workloads");
+    }
+    return workload;
 }
 
 // Convert high-resolution clock intervals into milliseconds.
@@ -558,8 +616,10 @@ static void print_evaluation_readiness(const Options& opt) {
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
-        if (opt.heterogeneous) {
-            PackedSortWorkload workload = make_heterogeneous_workload(opt);
+        if (opt.heterogeneous || !opt.request_manifest_path.empty()) {
+            PackedSortWorkload workload = opt.request_manifest_path.empty()
+                ? make_heterogeneous_workload(opt)
+                : load_request_manifest(opt.request_manifest_path);
             std::cout << "Heterogeneous request benchmark: requests=" << workload.requests.size()
                       << " input_pairs=" << workload.keys.size()
                       << " output_pairs=" << workload.reference_keys.size() << "\n";

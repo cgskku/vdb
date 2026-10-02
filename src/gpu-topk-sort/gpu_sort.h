@@ -29,6 +29,7 @@ struct Options {
     std::string csv_path;
     std::string keys_bin_path;
     std::string values_bin_path;
+    std::string request_manifest_path;
 };
 
 // Common result record for CPU and GPU benchmark paths.
@@ -99,6 +100,7 @@ void write_csv_summary(const std::string& path, const Options& opt, const std::v
 void write_neighbor_list_preview(const std::string& path, const std::vector<float>& keys, const std::vector<int>& values, int groups, int topk);
 void print_transfer_reduction(const Options& opt);
 PackedSortWorkload make_heterogeneous_workload(const Options& opt);
+PackedSortWorkload load_request_manifest(const std::string& path);
 
 // CUDA entrypoints are declared only when the runtime headers are available.
 #if GPU_SORT_HAS_CUDA

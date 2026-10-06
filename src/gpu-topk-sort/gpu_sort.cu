@@ -13,6 +13,9 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
 
 // Convert CUDA runtime failures into C++ exceptions with file and line context.
 #define CUDA_CHECK(call) do { \
@@ -101,6 +104,154 @@ void run_warmup_kernel(const std::vector<float>& keys) {
     CUDA_CHECK(cudaFree(d_tmp));
 }
 
+// Let each thread maintain a local insertion top-k list for one independent group.
+template <int TOPK_CAPACITY>
+__global__ void segmented_parallel_insertion_topk_kernel(
+    const float* keys,
+    const int* values,
+    int group_size,
+    int topk,
+    int group_offset,
+    int group_count,
+    float* out_keys,
+    int* out_values) {
+    int local_group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local_group >= group_count) {
+        return;
+    }
+    int group = group_offset + local_group;
+    float best_keys[TOPK_CAPACITY];
+    int best_values[TOPK_CAPACITY];
+    for (int rank = 0; rank < topk; ++rank) {
+        best_keys[rank] = INFINITY;
+        best_values[rank] = -1;
+    }
+
+    int input_base = group * group_size;
+    for (int candidate = 0; candidate < group_size; ++candidate) {
+        float key = keys[input_base + candidate];
+        int value = values[input_base + candidate];
+        if (key > best_keys[topk - 1] ||
+            (key == best_keys[topk - 1] && value >= best_values[topk - 1])) {
+            continue;
+        }
+        int position = topk - 1;
+        while (position > 0 &&
+               (key < best_keys[position - 1] ||
+                (key == best_keys[position - 1] && value < best_values[position - 1]))) {
+            best_keys[position] = best_keys[position - 1];
+            best_values[position] = best_values[position - 1];
+            --position;
+        }
+        best_keys[position] = key;
+        best_values[position] = value;
+    }
+
+    int output_base = group * topk;
+    for (int rank = 0; rank < topk; ++rank) {
+        out_keys[output_base + rank] = best_keys[rank];
+        out_values[output_base + rank] = best_values[rank];
+    }
+}
+
+// Select the smallest local-array specialization that can hold the requested top-k.
+static void launch_parallel_insertion(
+    const float* keys,
+    const int* values,
+    int group_size,
+    int topk,
+    int group_offset,
+    int group_count,
+    float* out_keys,
+    int* out_values,
+    cudaStream_t stream = 0) {
+    auto launch = [&](auto capacity, int threads) {
+        constexpr int topk_capacity = decltype(capacity)::value;
+        int blocks = (group_count + threads - 1) / threads;
+        segmented_parallel_insertion_topk_kernel<topk_capacity><<<blocks, threads, 0, stream>>>(
+            keys, values, group_size, topk, group_offset, group_count, out_keys, out_values);
+    };
+    if (topk <= 1) {
+        launch(std::integral_constant<int, 1>{}, 256);
+    } else if (topk <= 4) {
+        launch(std::integral_constant<int, 4>{}, 256);
+    } else if (topk <= 8) {
+        launch(std::integral_constant<int, 8>{}, 128);
+    } else if (topk <= 16) {
+        launch(std::integral_constant<int, 16>{}, 64);
+    } else if (topk <= 32) {
+        launch(std::integral_constant<int, 32>{}, 32);
+    } else if (topk <= 64) {
+        launch(std::integral_constant<int, 64>{}, 16);
+    } else {
+        launch(std::integral_constant<int, GPU_SORT_MAX_TOPK>{}, 8);
+    }
+}
+
+// Benchmark and validate the thread-per-group parallel insertion implementation.
+// CUDA events measure the device interval; host timing remains a separate metric.
+class KernelTimer {
+public:
+    KernelTimer() {
+        CUDA_CHECK(cudaEventCreate(&start_));
+        CUDA_CHECK(cudaEventCreate(&stop_));
+    }
+    ~KernelTimer() {
+        cudaEventDestroy(stop_);
+        cudaEventDestroy(start_);
+    }
+    void start() { CUDA_CHECK(cudaEventRecord(start_)); }
+    void stop() { CUDA_CHECK(cudaEventRecord(stop_)); }
+    double elapsed() {
+        CUDA_CHECK(cudaEventSynchronize(stop_));
+        float milliseconds = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_, stop_));
+        return milliseconds;
+    }
+private:
+    cudaEvent_t start_, stop_;
+};
+
+BenchResult run_gpu_parallel_insertion(
+    const Options& opt,
+    const std::vector<float>& keys,
+    const std::vector<int>& values,
+    const std::vector<float>& ref_keys,
+    const std::vector<int>& ref_values,
+    std::vector<float>* final_keys,
+    std::vector<int>* final_values) {
+    DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
+    double best_ms = std::numeric_limits<double>::infinity();
+    double best_kernel_ms = std::numeric_limits<double>::infinity();
+    KernelTimer timer;
+    for (int repeat = 0; repeat < opt.repeats; ++repeat) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double start = now_ms();
+        timer.start();
+        launch_parallel_insertion(
+            buffers.d_keys, buffers.d_values, opt.group_size, opt.topk, 0, opt.groups,
+            buffers.d_out_keys, buffers.d_out_values);
+        CUDA_CHECK(cudaGetLastError());
+        timer.stop();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        best_ms = std::min(best_ms, now_ms() - start);
+        best_kernel_ms = std::min(best_kernel_ms, timer.elapsed());
+    }
+    std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
+    std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
+    copy_to_host(got_keys, buffers.d_out_keys);
+    copy_to_host(got_values, buffers.d_out_values);
+    bool valid = validate_topk(
+        ref_keys, ref_values, got_keys, got_values, opt.groups, opt.topk);
+    if (final_keys) {
+        *final_keys = got_keys;
+    }
+    if (final_values) {
+        *final_values = got_values;
+    }
+    return {"gpu_parallel_insertion_topk", best_ms, valid, best_kernel_ms};
+}
+
 // Sort groups of at most 64 candidates with all lanes of one warp participating.
 __global__ void segmented_warp_micro_topk_kernel(
     const float* keys,
@@ -159,30 +310,7 @@ __global__ void segmented_warp_micro_topk_kernel(
     }
 }
 
-// Execute and validate the insertion-based segmented GPU top-k path.
-// CUDA events measure the device interval; host timing remains a separate metric.
-class KernelTimer {
-public:
-    KernelTimer() {
-        CUDA_CHECK(cudaEventCreate(&start_));
-        CUDA_CHECK(cudaEventCreate(&stop_));
-    }
-    ~KernelTimer() {
-        cudaEventDestroy(stop_);
-        cudaEventDestroy(start_);
-    }
-    void start() { CUDA_CHECK(cudaEventRecord(start_)); }
-    void stop() { CUDA_CHECK(cudaEventRecord(stop_)); }
-    double elapsed() {
-        CUDA_CHECK(cudaEventSynchronize(stop_));
-        float milliseconds = 0;
-        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_, stop_));
-        return milliseconds;
-    }
-private:
-    cudaEvent_t start_, stop_;
-};
-
+// Execute and validate the warp-cooperative segmented GPU top-k path.
 BenchResult run_gpu_insertion(
     const Options& opt,
     const std::vector<float>& keys,
@@ -497,6 +625,54 @@ BenchResult run_gpu_adaptive(
         return run_gpu_segmented_radix(
             opt, keys, values, ref_keys, ref_values, final_keys, final_values);
     }
+    if (opt.group_size <= 128) {
+        std::vector<float> insertion_keys;
+        std::vector<int> insertion_values;
+        std::vector<float> warp_keys;
+        std::vector<int> warp_values;
+        std::vector<float> bitonic_keys;
+        std::vector<int> bitonic_values;
+        BenchResult insertion = run_gpu_parallel_insertion(
+            opt, keys, values, ref_keys, ref_values,
+            final_keys ? &insertion_keys : nullptr,
+            final_values ? &insertion_values : nullptr);
+        BenchResult best = insertion;
+        std::vector<float>* best_keys = &insertion_keys;
+        std::vector<int>* best_values = &insertion_values;
+        bool all_valid = insertion.valid;
+
+        if (opt.group_size <= 64) {
+            BenchResult warp = run_gpu_insertion(
+                opt, keys, values, ref_keys, ref_values,
+                final_keys ? &warp_keys : nullptr,
+                final_values ? &warp_values : nullptr);
+            all_valid = all_valid && warp.valid;
+            if (warp.milliseconds < best.milliseconds) {
+                best = warp;
+                best_keys = &warp_keys;
+                best_values = &warp_values;
+            }
+        }
+        BenchResult bitonic = run_gpu_bitonic(
+            opt, keys, values, ref_keys, ref_values,
+            final_keys ? &bitonic_keys : nullptr,
+            final_values ? &bitonic_values : nullptr);
+        all_valid = all_valid && bitonic.valid;
+        if (bitonic.milliseconds < best.milliseconds) {
+            best = bitonic;
+            best_keys = &bitonic_keys;
+            best_values = &bitonic_values;
+        }
+        if (final_keys) {
+            *final_keys = std::move(*best_keys);
+        }
+        if (final_values) {
+            *final_values = std::move(*best_values);
+        }
+        best.name = "gpu_autotuned_" + best.name.substr(4);
+        best.valid = all_valid;
+        return best;
+    }
     DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
     double best_ms = std::numeric_limits<double>::infinity();
     double best_kernel_ms = std::numeric_limits<double>::infinity();
@@ -780,19 +956,59 @@ static std::vector<int> assign_request_streams(
     return assignments;
 }
 
-// Launch one caller-owned device request on the selected CUDA stream.
+enum class DeviceSortAlgorithm {
+    ParallelInsertion,
+    WarpMicro,
+    BlockBitonic,
+    SegmentedRadix
+};
+
+struct DeviceShape {
+    int groups = 0;
+    int group_size = 0;
+    int topk = 0;
+
+    bool operator==(const DeviceShape& other) const {
+        return groups == other.groups &&
+               group_size == other.group_size &&
+               topk == other.topk;
+    }
+};
+
+struct DeviceShapeHash {
+    size_t operator()(const DeviceShape& shape) const {
+        size_t hash = std::hash<int>{}(shape.groups);
+        hash ^= std::hash<int>{}(shape.group_size) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<int>{}(shape.topk) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+        return hash;
+    }
+};
+
+// Build an exact cache key from every shape dimension that affects kernel cost.
+static DeviceShape shape_key(const DeviceTopkRequest& request) {
+    return {request.groups, request.group_size, request.topk};
+}
+
+// Launch one caller-owned device request with the selected algorithm.
 static void launch_device_request(
     const DeviceTopkRequest& request,
     RadixRequestWorkspace* radix,
-    cudaStream_t stream) {
-    if (request.group_size <= 64) {
+    cudaStream_t stream,
+    DeviceSortAlgorithm algorithm) {
+    if (algorithm == DeviceSortAlgorithm::ParallelInsertion) {
+        launch_parallel_insertion(
+            request.keys, request.values, request.group_size, request.topk, 0,
+            request.groups, request.out_keys, request.out_values, stream);
+        return;
+    }
+    if (algorithm == DeviceSortAlgorithm::WarpMicro) {
         segmented_warp_micro_topk_kernel<<<request.groups, 32, 0, stream>>>(
             request.keys, request.values, request.group_size,
             next_power_of_two(request.group_size), request.topk, 0,
             request.out_keys, request.out_values);
         return;
     }
-    if (request.group_size <= 1024) {
+    if (algorithm == DeviceSortAlgorithm::BlockBitonic) {
         int threads = next_power_of_two(request.group_size);
         size_t shared_bytes = static_cast<size_t>(threads) * (sizeof(float) + sizeof(int));
         segmented_bitonic_topk_kernel<<<request.groups, threads, shared_bytes, stream>>>(
@@ -820,12 +1036,60 @@ static void launch_device_request(
         request.out_keys, request.out_values);
 }
 
+// Time every feasible small-group kernel and retain the fastest choice for this shape.
+static DeviceSortAlgorithm tune_device_algorithm(
+    const DeviceTopkRequest& request,
+    cudaStream_t stream) {
+    if (request.group_size > 1024) {
+        return DeviceSortAlgorithm::SegmentedRadix;
+    }
+    if (request.group_size > 128) {
+        return DeviceSortAlgorithm::BlockBitonic;
+    }
+
+    auto measure = [&](DeviceSortAlgorithm algorithm) {
+        cudaEvent_t start;
+        cudaEvent_t stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        float best_ms = std::numeric_limits<float>::infinity();
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            CUDA_CHECK(cudaEventRecord(start, stream));
+            launch_device_request(request, nullptr, stream, algorithm);
+            CUDA_CHECK(cudaEventRecord(stop, stream));
+            CUDA_CHECK(cudaEventSynchronize(stop));
+            float elapsed = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
+            best_ms = std::min(best_ms, elapsed);
+        }
+        CUDA_CHECK(cudaEventDestroy(stop));
+        CUDA_CHECK(cudaEventDestroy(start));
+        return best_ms;
+    };
+
+    DeviceSortAlgorithm best_algorithm = DeviceSortAlgorithm::ParallelInsertion;
+    float best_ms = measure(best_algorithm);
+    if (request.group_size <= 64) {
+        float warp_ms = measure(DeviceSortAlgorithm::WarpMicro);
+        if (warp_ms < best_ms) {
+            best_ms = warp_ms;
+            best_algorithm = DeviceSortAlgorithm::WarpMicro;
+        }
+    }
+    float bitonic_ms = measure(DeviceSortAlgorithm::BlockBitonic);
+    if (bitonic_ms < best_ms) {
+        best_algorithm = DeviceSortAlgorithm::BlockBitonic;
+    }
+    return best_algorithm;
+}
+
 // Translate offsets in a packed workload into the public device-pointer request contract.
 static void launch_packed_request(
     const PackedDeviceBuffers& buffers,
     const SortRequestDescriptor& request,
     RadixRequestWorkspace* radix,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    DeviceSortAlgorithm algorithm) {
     DeviceTopkRequest device_request;
     device_request.keys = buffers.d_keys + request.input_offset;
     device_request.values = buffers.d_values + request.input_offset;
@@ -834,7 +1098,7 @@ static void launch_packed_request(
     device_request.groups = request.groups;
     device_request.group_size = request.group_size;
     device_request.topk = request.topk;
-    launch_device_request(device_request, radix, stream);
+    launch_device_request(device_request, radix, stream, algorithm);
 }
 
 // Keep stream load and per-request radix storage behind the public C++ API.
@@ -846,6 +1110,7 @@ struct GpuTopkScheduler::Impl {
     StreamPool pool;
     std::vector<double> loads;
     std::vector<std::unique_ptr<RadixRequestWorkspace>> pending_radix;
+    std::unordered_map<DeviceShape, DeviceSortAlgorithm, DeviceShapeHash> algorithms;
 };
 
 GpuTopkScheduler::GpuTopkScheduler(int stream_count)
@@ -869,6 +1134,10 @@ void GpuTopkScheduler::submit(const DeviceTopkRequest& request) {
         request.topk > request.group_size || request.topk > GPU_SORT_MAX_TOPK) {
         throw std::runtime_error("device top-k request has an invalid shape");
     }
+    if (static_cast<size_t>(request.groups) * request.group_size >
+        static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("device top-k request exceeds the 32-bit index range");
+    }
     int stream_index = static_cast<int>(
         std::min_element(impl_->loads.begin(), impl_->loads.end()) - impl_->loads.begin());
     RadixRequestWorkspace* radix = nullptr;
@@ -881,7 +1150,15 @@ void GpuTopkScheduler::submit(const DeviceTopkRequest& request) {
             std::make_unique<RadixRequestWorkspace>(descriptor));
         radix = impl_->pending_radix.back().get();
     }
-    launch_device_request(request, radix, impl_->pool.get(stream_index));
+    DeviceShape key = shape_key(request);
+    auto found = impl_->algorithms.find(key);
+    if (found == impl_->algorithms.end()) {
+        DeviceSortAlgorithm selected = tune_device_algorithm(
+            request, impl_->pool.get(stream_index));
+        found = impl_->algorithms.emplace(key, selected).first;
+    }
+    launch_device_request(
+        request, radix, impl_->pool.get(stream_index), found->second);
     double candidates = static_cast<double>(request.groups) * request.group_size;
     impl_->loads[stream_index] +=
         candidates * (std::log2(static_cast<double>(request.group_size)) + 1.0);
@@ -910,6 +1187,28 @@ SchedulerComparison run_gpu_heterogeneous_scheduler(
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<int> assignments = assign_request_streams(workload, opt.streams);
+    std::vector<DeviceSortAlgorithm> algorithms;
+    std::unordered_map<DeviceShape, DeviceSortAlgorithm, DeviceShapeHash> algorithm_cache;
+    algorithms.reserve(workload.requests.size());
+    for (const auto& request : workload.requests) {
+        DeviceTopkRequest device_request;
+        device_request.keys = buffers.d_keys + request.input_offset;
+        device_request.values = buffers.d_values + request.input_offset;
+        device_request.out_keys = buffers.d_out_keys + request.output_offset;
+        device_request.out_values = buffers.d_out_values + request.output_offset;
+        device_request.groups = request.groups;
+        device_request.group_size = request.group_size;
+        device_request.topk = request.topk;
+        DeviceShape key = shape_key(device_request);
+        auto found = algorithm_cache.find(key);
+        if (found == algorithm_cache.end()) {
+            DeviceSortAlgorithm selected = tune_device_algorithm(
+                device_request, pool.get(0));
+            found = algorithm_cache.emplace(key, selected).first;
+        }
+        algorithms.push_back(found->second);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     bool policies_valid = true;
     auto measure = [&](bool asynchronous) {
@@ -924,7 +1223,7 @@ SchedulerComparison run_gpu_heterogeneous_scheduler(
                 int stream_index = asynchronous ? assignments[i] : 0;
                 launch_packed_request(
                     buffers, workload.requests[i], radix_workspaces[i].get(),
-                    pool.get(stream_index));
+                    pool.get(stream_index), algorithms[i]);
             }
             CUDA_CHECK(cudaGetLastError());
             pool.synchronize();
@@ -992,6 +1291,62 @@ BenchResult run_gpu_device_api_validation(
         }
     }
     return {"gpu_device_pointer_api", elapsed, valid};
+}
+
+// Measure the full heterogeneous path from packed host input to compact host output.
+PipelineTiming run_gpu_heterogeneous_pipeline(
+    const Options& opt,
+    const PackedSortWorkload& workload) {
+    PipelineTiming best;
+    best.total_ms = std::numeric_limits<double>::infinity();
+    for (int repeat = 0; repeat < opt.repeats; ++repeat) {
+        double total_start = now_ms();
+        double h2d_start = now_ms();
+        PackedDeviceBuffers buffers(workload);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double h2d_ms = now_ms() - h2d_start;
+
+        GpuTopkScheduler scheduler(opt.streams);
+        double kernel_start = now_ms();
+        for (const auto& request : workload.requests) {
+            DeviceTopkRequest device_request;
+            device_request.keys = buffers.d_keys + request.input_offset;
+            device_request.values = buffers.d_values + request.input_offset;
+            device_request.out_keys = buffers.d_out_keys + request.output_offset;
+            device_request.out_values = buffers.d_out_values + request.output_offset;
+            device_request.groups = request.groups;
+            device_request.group_size = request.group_size;
+            device_request.topk = request.topk;
+            scheduler.submit(device_request);
+        }
+        scheduler.synchronize();
+        double kernel_ms = now_ms() - kernel_start;
+
+        std::vector<float> got_keys(workload.reference_keys.size());
+        std::vector<int> got_values(workload.reference_values.size());
+        double d2h_start = now_ms();
+        copy_to_host(got_keys, buffers.d_out_keys);
+        copy_to_host(got_values, buffers.d_out_values);
+        double d2h_ms = now_ms() - d2h_start;
+        double total_ms = now_ms() - total_start;
+
+        bool valid = true;
+        for (size_t i = 0; i < got_keys.size(); ++i) {
+            if (std::fabs(got_keys[i] - workload.reference_keys[i]) > 1e-4f ||
+                got_values[i] != workload.reference_values[i]) {
+                valid = false;
+                break;
+            }
+        }
+        if (total_ms < best.total_ms) {
+            best.h2d_ms = h2d_ms;
+            best.kernel_ms = kernel_ms;
+            best.d2h_ms = d2h_ms;
+            best.total_ms = total_ms;
+            best.valid = valid;
+        }
+    }
+    return best;
 }
 
 // Reject distance-tile inputs that do not match the configured row layout.

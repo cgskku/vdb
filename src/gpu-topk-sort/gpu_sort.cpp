@@ -88,6 +88,10 @@ Options parse_options(int argc, char** argv) {
     if (opt.topk > GPU_SORT_MAX_TOPK) {
         throw std::runtime_error("topk exceeds GPU_SORT_MAX_TOPK; rebuild with a larger limit");
     }
+    if (static_cast<size_t>(opt.groups) * opt.group_size >
+        static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("groups * group-size exceeds the supported 32-bit index range");
+    }
     if (opt.streams <= 0) {
         opt.streams = 1;
     }
@@ -277,6 +281,10 @@ PackedSortWorkload load_request_manifest(const std::string& path) {
         if (groups <= 0 || group_size <= 0 || topk <= 0 ||
             topk > group_size || topk > GPU_SORT_MAX_TOPK) {
             throw std::runtime_error("invalid request shape for " + name);
+        }
+        if (static_cast<size_t>(groups) * group_size >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+            throw std::runtime_error("request exceeds the supported 32-bit index range: " + name);
         }
         std::filesystem::path keys_file(keys_path);
         std::filesystem::path values_file(values_path);
@@ -612,6 +620,42 @@ static void print_evaluation_readiness(const Options& opt) {
     std::cout << "Evaluation readiness: synthetic, binary OpenAI workload, CSV, and validation paths are available\n";
 }
 
+// Packed total includes request slicing and output allocation; sort phase is measured separately.
+static double benchmark_packed_cpu(const PackedSortWorkload& workload, int repeats,
+                                   double& sort_phase_ms) {
+    double best_ms = std::numeric_limits<double>::infinity();
+    sort_phase_ms = std::numeric_limits<double>::infinity();
+    for (int profile = 0; profile < 2; ++profile) {
+        for (int repeat = 0; repeat < repeats; ++repeat) {
+            double start = now_ms();
+            double sort_sum = 0.0;
+            for (const auto& request : workload.requests) {
+                size_t input_count = static_cast<size_t>(request.groups) * request.group_size;
+                std::vector<float> keys(workload.keys.begin() + request.input_offset,
+                    workload.keys.begin() + request.input_offset + input_count);
+                std::vector<int> values(workload.values.begin() + request.input_offset,
+                    workload.values.begin() + request.input_offset + input_count);
+                std::vector<float> output_keys;
+                std::vector<int> output_values;
+                if (profile) {
+                    auto phases = cpu_segmented_topk_profiled(keys, values, request.groups,
+                        request.group_size, request.topk, output_keys, output_values);
+                    sort_sum += phases.topk_sort_ms;
+                } else {
+                    cpu_segmented_topk(keys, values, request.groups, request.group_size,
+                        request.topk, output_keys, output_values);
+                }
+            }
+            if (profile) {
+                sort_phase_ms = std::min(sort_phase_ms, sort_sum);
+            } else {
+                best_ms = std::min(best_ms, now_ms() - start);
+            }
+        }
+    }
+    return best_ms;
+}
+
 // Drive input loading, reference generation, optional GPU paths, and reporting.
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
@@ -623,6 +667,12 @@ int run_gpu_sort_demo(int argc, char** argv) {
             std::cout << "Heterogeneous request benchmark: requests=" << workload.requests.size()
                       << " input_pairs=" << workload.keys.size()
                       << " output_pairs=" << workload.reference_keys.size() << "\n";
+            double sort_phase_ms;
+            double cpu_ms = benchmark_packed_cpu(workload, opt.repeats, sort_phase_ms);
+            std::cout << "  cpu_packed_sort_phase " << std::fixed << std::setprecision(6)
+                      << sort_phase_ms << " ms\n";
+            std::cout << "  cpu_packed_total " << std::fixed << std::setprecision(6)
+                      << cpu_ms << " ms\n";
 #if GPU_SORT_HAS_CUDA
             BenchResult result = run_gpu_heterogeneous_sequential(opt, workload);
             std::cout << "  " << result.name << " " << std::fixed << std::setprecision(6)
@@ -641,7 +691,13 @@ int run_gpu_sort_demo(int argc, char** argv) {
             BenchResult api_result = run_gpu_device_api_validation(opt, workload);
             std::cout << "  " << api_result.name << " " << api_result.milliseconds
                       << " ms valid=" << (api_result.valid ? "yes" : "no") << "\n";
-            return result.valid && comparison.valid && api_result.valid ? 0 : 1;
+            PipelineTiming pipeline = run_gpu_heterogeneous_pipeline(opt, workload);
+            std::cout << "  gpu_pipeline_h2d " << pipeline.h2d_ms << " ms\n"
+                      << "  gpu_pipeline_scheduler " << pipeline.kernel_ms << " ms\n"
+                      << "  gpu_pipeline_d2h " << pipeline.d2h_ms << " ms\n"
+                      << "  gpu_pipeline_total " << pipeline.total_ms << " ms\n"
+                      << "  end_to_end_speedup " << cpu_ms / pipeline.total_ms << "x\n";
+            return result.valid && comparison.valid && api_result.valid && pipeline.valid ? 0 : 1;
 #else
             std::cout << "CUDA runtime was not available at build time.\n";
             return 0;
@@ -715,6 +771,10 @@ int run_gpu_sort_demo(int argc, char** argv) {
 #endif
 
 #if GPU_SORT_HAS_CUDA
+        if (opt.group_size <= 128) {
+            results.push_back(run_gpu_parallel_insertion(
+                opt, keys, values, cpu_keys, cpu_values));
+        }
         if (opt.group_size <= 64) {
             results.push_back(run_gpu_insertion(opt, keys, values, cpu_keys, cpu_values));
         }
@@ -731,7 +791,7 @@ int run_gpu_sort_demo(int argc, char** argv) {
 #if GPU_SORT_HAS_CUDA
         const char* selected_path = opt.group_size > 1024
             ? "CUB segmented radix"
-            : (use_insertion_path(opt) ? "warp micro-sort" : "bitonic");
+            : (opt.group_size <= 128 ? "runtime autotuning" : "bitonic");
         std::cout << "Adaptive dispatcher selected " << selected_path << " for this workload.\n";
         results.push_back(run_gpu_adaptive(opt, keys, values, cpu_keys, cpu_values));
 #endif

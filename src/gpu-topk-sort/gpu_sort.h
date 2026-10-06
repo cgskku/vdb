@@ -1,6 +1,7 @@
 #ifndef GPU_SORT_H
 #define GPU_SORT_H
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -131,6 +132,7 @@ private:
 };
 
 void run_warmup_kernel(const std::vector<float>& keys);
+BenchResult run_gpu_parallel_insertion(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
 BenchResult run_gpu_insertion(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
 BenchResult run_gpu_bitonic(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
 BenchResult run_gpu_segmented_radix(const Options& opt, const std::vector<float>& keys, const std::vector<int>& values, const std::vector<float>& ref_keys, const std::vector<int>& ref_values, std::vector<float>* final_keys = nullptr, std::vector<int>* final_values = nullptr);
@@ -141,6 +143,7 @@ PipelineTiming run_gpu_scheduler_pipeline(const Options& opt, const std::vector<
 BenchResult run_gpu_heterogeneous_sequential(const Options& opt, const PackedSortWorkload& workload);
 SchedulerComparison run_gpu_heterogeneous_scheduler(const Options& opt, const PackedSortWorkload& workload);
 BenchResult run_gpu_device_api_validation(const Options& opt, const PackedSortWorkload& workload);
+PipelineTiming run_gpu_heterogeneous_pipeline(const Options& opt, const PackedSortWorkload& workload);
 BenchResult run_distance_tile_topk_adapter(const Options& opt, const std::vector<float>& tile_distances, const std::vector<int>& candidate_ids, std::vector<float>& out_keys, std::vector<int>& out_values);
 BenchResult run_distance_tile_topk_adapter_end_to_end(const Options& opt, const std::vector<float>& tile_distances, const std::vector<int>& candidate_ids);
 #endif

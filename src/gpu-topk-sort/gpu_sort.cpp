@@ -21,7 +21,7 @@ void print_usage(const char* prog) {
     std::cout << "Usage: " << prog
               << " [--groups N] [--group-size N] [--topk K] [--streams N] [--repeats N]"
               << " [--csv path] [--keys-bin path] [--values-bin path] [--profile-cpu]"
-              << " [--heterogeneous] [--requests N] [--request-manifest path]\n";
+              << " [--heterogeneous] [--requests N] [--queue-depth N] [--request-manifest path]\n";
 }
 
 // Parse command-line options and normalize invalid benchmark values early.
@@ -68,6 +68,9 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--requests") {
             opt.requests = std::atoi(need_value("--requests"));
         }
+        else if (arg == "--queue-depth") {
+            opt.queue_depth = std::atoi(need_value("--queue-depth"));
+        }
         else if (arg == "--request-manifest") {
             opt.request_manifest_path = need_value("--request-manifest");
         }
@@ -100,6 +103,9 @@ Options parse_options(int argc, char** argv) {
     }
     if (opt.requests <= 0) {
         throw std::runtime_error("requests must be positive");
+    }
+    if (opt.queue_depth <= 0) {
+        throw std::runtime_error("queue-depth must be positive");
     }
     return opt;
 }
@@ -691,13 +697,17 @@ int run_gpu_sort_demo(int argc, char** argv) {
             BenchResult api_result = run_gpu_device_api_validation(opt, workload);
             std::cout << "  " << api_result.name << " " << api_result.milliseconds
                       << " ms valid=" << (api_result.valid ? "yes" : "no") << "\n";
+            BenchResult queue_result = run_gpu_request_queue_validation(opt, workload);
+            std::cout << "  " << queue_result.name << " " << queue_result.milliseconds
+                      << " ms valid=" << (queue_result.valid ? "yes" : "no") << "\n";
             PipelineTiming pipeline = run_gpu_heterogeneous_pipeline(opt, workload);
             std::cout << "  gpu_pipeline_h2d " << pipeline.h2d_ms << " ms\n"
                       << "  gpu_pipeline_scheduler " << pipeline.kernel_ms << " ms\n"
                       << "  gpu_pipeline_d2h " << pipeline.d2h_ms << " ms\n"
                       << "  gpu_pipeline_total " << pipeline.total_ms << " ms\n"
                       << "  end_to_end_speedup " << cpu_ms / pipeline.total_ms << "x\n";
-            return result.valid && comparison.valid && api_result.valid && pipeline.valid ? 0 : 1;
+            return result.valid && comparison.valid && api_result.valid &&
+                   queue_result.valid && pipeline.valid ? 0 : 1;
 #else
             std::cout << "CUDA runtime was not available at build time.\n";
             return 0;

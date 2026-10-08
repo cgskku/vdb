@@ -7,12 +7,18 @@
 #include <cub/device/device_segmented_radix_sort.cuh>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -1170,6 +1176,189 @@ void GpuTopkScheduler::synchronize() {
     std::fill(impl_->loads.begin(), impl_->loads.end(), 0.0);
 }
 
+// Share completion state between the producer-facing ticket and the queue worker.
+struct GpuTopkCompletion::State {
+    mutable std::mutex mutex;
+    mutable std::condition_variable completed_cv;
+    bool completed = false;
+    std::exception_ptr error;
+};
+
+GpuTopkCompletion::GpuTopkCompletion(std::shared_ptr<State> state)
+    : state_(std::move(state)) {}
+
+void GpuTopkCompletion::wait() const {
+    if (!state_) {
+        throw std::runtime_error("cannot wait on an empty GPU top-k completion");
+    }
+    std::unique_lock<std::mutex> lock(state_->mutex);
+    state_->completed_cv.wait(lock, [&] { return state_->completed; });
+    if (state_->error) {
+        std::rethrow_exception(state_->error);
+    }
+}
+
+bool GpuTopkCompletion::ready() const {
+    if (!state_) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->completed;
+}
+
+GpuTopkCompletion::operator bool() const {
+    return static_cast<bool>(state_);
+}
+
+// Keep host queue synchronization and the GPU scheduler behind one public queue object.
+struct GpuTopkRequestQueue::Impl {
+    struct PendingRequest {
+        DeviceTopkRequest request;
+        std::shared_ptr<GpuTopkCompletion::State> completion;
+    };
+
+    Impl(int stream_count, size_t maximum_pending)
+        : scheduler(stream_count), max_pending(std::max<size_t>(1, maximum_pending)) {
+        CUDA_CHECK(cudaGetDevice(&device));
+        worker = std::thread([this] { worker_loop(); });
+    }
+
+    ~Impl() {
+        try {
+            flush();
+        } catch (...) {
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        work_cv.notify_all();
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    std::shared_ptr<GpuTopkCompletion::State> enqueue(const DeviceTopkRequest& request) {
+        auto completion = std::make_shared<GpuTopkCompletion::State>();
+        std::unique_lock<std::mutex> lock(mutex);
+        capacity_cv.wait(lock, [&] { return stopping || outstanding < max_pending; });
+        if (stopping) {
+            throw std::runtime_error("cannot enqueue into a stopped GPU top-k request queue");
+        }
+        pending.push_back({request, completion});
+        ++outstanding;
+        lock.unlock();
+        work_cv.notify_one();
+        return completion;
+    }
+
+    void flush() {
+        std::unique_lock<std::mutex> lock(mutex);
+        drained_cv.wait(lock, [&] { return outstanding == 0; });
+        if (first_error) {
+            std::rethrow_exception(first_error);
+        }
+    }
+
+    size_t pending_count() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return outstanding;
+    }
+
+    void worker_loop() {
+        std::exception_ptr device_error;
+        try {
+            CUDA_CHECK(cudaSetDevice(device));
+        } catch (...) {
+            device_error = std::current_exception();
+        }
+
+        for (;;) {
+            std::vector<PendingRequest> batch;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                work_cv.wait(lock, [&] { return stopping || !pending.empty(); });
+                if (stopping && pending.empty()) {
+                    return;
+                }
+                work_cv.wait_for(lock, std::chrono::microseconds(200), [&] {
+                    return stopping || pending.size() >= max_pending;
+                });
+                while (!pending.empty()) {
+                    batch.push_back(std::move(pending.front()));
+                    pending.pop_front();
+                }
+            }
+
+            std::exception_ptr batch_error = device_error;
+            if (!batch_error) {
+                try {
+                    for (const auto& item : batch) {
+                        scheduler.submit(item.request);
+                    }
+                    scheduler.synchronize();
+                } catch (...) {
+                    batch_error = std::current_exception();
+                    try {
+                        scheduler.synchronize();
+                    } catch (...) {
+                    }
+                }
+            }
+
+            for (const auto& item : batch) {
+                {
+                    std::lock_guard<std::mutex> state_lock(item.completion->mutex);
+                    item.completion->error = batch_error;
+                    item.completion->completed = true;
+                }
+                item.completion->completed_cv.notify_all();
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                outstanding -= batch.size();
+                if (batch_error && !first_error) {
+                    first_error = batch_error;
+                }
+            }
+            capacity_cv.notify_all();
+            drained_cv.notify_all();
+        }
+    }
+
+    GpuTopkScheduler scheduler;
+    size_t max_pending = 1;
+    int device = 0;
+    mutable std::mutex mutex;
+    std::condition_variable work_cv;
+    std::condition_variable capacity_cv;
+    std::condition_variable drained_cv;
+    std::deque<PendingRequest> pending;
+    size_t outstanding = 0;
+    bool stopping = false;
+    std::exception_ptr first_error;
+    std::thread worker;
+};
+
+GpuTopkRequestQueue::GpuTopkRequestQueue(int stream_count, size_t max_pending)
+    : impl_(new Impl(stream_count, max_pending)) {}
+
+GpuTopkRequestQueue::~GpuTopkRequestQueue() {
+    delete impl_;
+}
+
+GpuTopkCompletion GpuTopkRequestQueue::enqueue(const DeviceTopkRequest& request) {
+    return GpuTopkCompletion(impl_->enqueue(request));
+}
+
+void GpuTopkRequestQueue::flush() {
+    impl_->flush();
+}
+
+size_t GpuTopkRequestQueue::pending() const {
+    return impl_->pending_count();
+}
+
 // Compare serialized and cost-balanced submissions on the same resident device buffers.
 SchedulerComparison run_gpu_heterogeneous_scheduler(
     const Options& opt,
@@ -1291,6 +1480,53 @@ BenchResult run_gpu_device_api_validation(
         }
     }
     return {"gpu_device_pointer_api", elapsed, valid};
+}
+
+// Validate producer-side queueing, bounded pending work, and completion tracking.
+BenchResult run_gpu_request_queue_validation(
+    const Options& opt,
+    const PackedSortWorkload& workload) {
+    PackedDeviceBuffers buffers(workload);
+    GpuTopkRequestQueue queue(
+        opt.streams, static_cast<size_t>(opt.queue_depth));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    double best_ms = std::numeric_limits<double>::infinity();
+    for (int repeat = 0; repeat < opt.repeats; ++repeat) {
+        std::vector<GpuTopkCompletion> completions;
+        completions.reserve(workload.requests.size());
+        double start = now_ms();
+        for (const auto& request : workload.requests) {
+            DeviceTopkRequest device_request;
+            device_request.keys = buffers.d_keys + request.input_offset;
+            device_request.values = buffers.d_values + request.input_offset;
+            device_request.out_keys = buffers.d_out_keys + request.output_offset;
+            device_request.out_values = buffers.d_out_values + request.output_offset;
+            device_request.groups = request.groups;
+            device_request.group_size = request.group_size;
+            device_request.topk = request.topk;
+            completions.push_back(queue.enqueue(device_request));
+        }
+        for (const auto& completion : completions) {
+            completion.wait();
+        }
+        queue.flush();
+        best_ms = std::min(best_ms, now_ms() - start);
+    }
+
+    std::vector<float> got_keys(workload.reference_keys.size());
+    std::vector<int> got_values(workload.reference_values.size());
+    copy_to_host(got_keys, buffers.d_out_keys);
+    copy_to_host(got_values, buffers.d_out_values);
+    bool valid = true;
+    for (size_t index = 0; index < got_keys.size(); ++index) {
+        if (std::fabs(got_keys[index] - workload.reference_keys[index]) > 1e-4f ||
+            got_values[index] != workload.reference_values[index]) {
+            valid = false;
+            break;
+        }
+    }
+    return {"gpu_async_request_queue", best_ms, valid};
 }
 
 // Measure the full heterogeneous path from packed host input to compact host output.

@@ -944,22 +944,67 @@ struct RadixRequestWorkspace {
     }
 };
 
-// Assign requests to the currently least-loaded stream using an n log n cost estimate.
+// Estimate sorting work without depending on a specific kernel implementation.
+static double request_sort_cost(const SortRequestDescriptor& request) {
+    double candidates = static_cast<double>(request.groups) * request.group_size;
+    return candidates * (std::log2(static_cast<double>(request.group_size)) + 1.0);
+}
+
+static double device_request_sort_cost(const DeviceTopkRequest& request) {
+    double candidates = static_cast<double>(request.groups) * request.group_size;
+    return candidates * (std::log2(static_cast<double>(request.group_size)) + 1.0);
+}
+
+// Reproduce the simple request-index assignment used by the initial scheduler.
+static std::vector<int> assign_request_streams_round_robin(
+    const PackedSortWorkload& workload,
+    int stream_count) {
+    stream_count = std::max(1, stream_count);
+    std::vector<int> assignments(workload.requests.size(), 0);
+    for (size_t index = 0; index < workload.requests.size(); ++index) {
+        assignments[index] = static_cast<int>(index % stream_count);
+    }
+    return assignments;
+}
+
+// Assign large requests first to the currently least-loaded stream.
 static std::vector<int> assign_request_streams(
     const PackedSortWorkload& workload,
     int stream_count) {
     stream_count = std::max(1, stream_count);
     std::vector<double> loads(static_cast<size_t>(stream_count), 0.0);
     std::vector<int> assignments(workload.requests.size(), 0);
-    for (size_t i = 0; i < workload.requests.size(); ++i) {
-        const auto& request = workload.requests[i];
+    std::vector<size_t> order(workload.requests.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
+        return request_sort_cost(workload.requests[lhs]) >
+               request_sort_cost(workload.requests[rhs]);
+    });
+    for (size_t index : order) {
         int stream = static_cast<int>(
             std::min_element(loads.begin(), loads.end()) - loads.begin());
-        assignments[i] = stream;
-        double candidates = static_cast<double>(request.groups) * request.group_size;
-        loads[stream] += candidates * (std::log2(static_cast<double>(request.group_size)) + 1.0);
+        assignments[index] = stream;
+        loads[stream] += request_sort_cost(workload.requests[index]);
     }
     return assignments;
+}
+
+// Report the largest predicted stream load relative to the average stream load.
+static double assignment_load_imbalance(
+    const PackedSortWorkload& workload,
+    const std::vector<int>& assignments,
+    int stream_count) {
+    stream_count = std::max(1, stream_count);
+    std::vector<double> loads(static_cast<size_t>(stream_count), 0.0);
+    for (size_t index = 0; index < workload.requests.size(); ++index) {
+        loads[assignments[index]] += request_sort_cost(workload.requests[index]);
+    }
+    double total = std::accumulate(loads.begin(), loads.end(), 0.0);
+    if (total == 0.0) {
+        return 1.0;
+    }
+    double average = total / loads.size();
+    return *std::max_element(loads.begin(), loads.end()) / average;
 }
 
 enum class DeviceSortAlgorithm {
@@ -1165,9 +1210,7 @@ void GpuTopkScheduler::submit(const DeviceTopkRequest& request) {
     }
     launch_device_request(
         request, radix, impl_->pool.get(stream_index), found->second);
-    double candidates = static_cast<double>(request.groups) * request.group_size;
-    impl_->loads[stream_index] +=
-        candidates * (std::log2(static_cast<double>(request.group_size)) + 1.0);
+    impl_->loads[stream_index] += device_request_sort_cost(request);
 }
 
 void GpuTopkScheduler::synchronize() {
@@ -1293,6 +1336,11 @@ struct GpuTopkRequestQueue::Impl {
             std::exception_ptr batch_error = device_error;
             if (!batch_error) {
                 try {
+                    // LPT ordering lets the online least-load selector balance the full batch.
+                    std::stable_sort(batch.begin(), batch.end(), [](const auto& lhs, const auto& rhs) {
+                        return device_request_sort_cost(lhs.request) >
+                               device_request_sort_cost(rhs.request);
+                    });
                     for (const auto& item : batch) {
                         scheduler.submit(item.request);
                     }
@@ -1375,7 +1423,9 @@ SchedulerComparison run_gpu_heterogeneous_scheduler(
         }
     }
     CUDA_CHECK(cudaDeviceSynchronize());
-    std::vector<int> assignments = assign_request_streams(workload, opt.streams);
+    std::vector<int> round_robin_assignments =
+        assign_request_streams_round_robin(workload, opt.streams);
+    std::vector<int> balanced_assignments = assign_request_streams(workload, opt.streams);
     std::vector<DeviceSortAlgorithm> algorithms;
     std::unordered_map<DeviceShape, DeviceSortAlgorithm, DeviceShapeHash> algorithm_cache;
     algorithms.reserve(workload.requests.size());
@@ -1400,7 +1450,7 @@ SchedulerComparison run_gpu_heterogeneous_scheduler(
     CUDA_CHECK(cudaDeviceSynchronize());
 
     bool policies_valid = true;
-    auto measure = [&](bool asynchronous) {
+    auto measure = [&](const std::vector<int>* assignments) {
         double best_ms = std::numeric_limits<double>::infinity();
         for (int repeat = 0; repeat < opt.repeats; ++repeat) {
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -1409,7 +1459,7 @@ SchedulerComparison run_gpu_heterogeneous_scheduler(
             CUDA_CHECK(cudaDeviceSynchronize());
             double start = now_ms();
             for (size_t i = 0; i < workload.requests.size(); ++i) {
-                int stream_index = asynchronous ? assignments[i] : 0;
+                int stream_index = assignments ? (*assignments)[i] : 0;
                 launch_packed_request(
                     buffers, workload.requests[i], radix_workspaces[i].get(),
                     pool.get(stream_index), algorithms[i]);
@@ -1428,8 +1478,13 @@ SchedulerComparison run_gpu_heterogeneous_scheduler(
     };
 
     SchedulerComparison comparison;
-    comparison.sequential_ms = measure(false);
-    comparison.asynchronous_ms = measure(true);
+    comparison.sequential_ms = measure(nullptr);
+    comparison.round_robin_ms = measure(&round_robin_assignments);
+    comparison.asynchronous_ms = measure(&balanced_assignments);
+    comparison.round_robin_load_imbalance = assignment_load_imbalance(
+        workload, round_robin_assignments, opt.streams);
+    comparison.cost_balanced_load_imbalance = assignment_load_imbalance(
+        workload, balanced_assignments, opt.streams);
     std::vector<float> got_keys(workload.reference_keys.size());
     std::vector<int> got_values(workload.reference_values.size());
     copy_to_host(got_keys, buffers.d_out_keys);
@@ -1452,20 +1507,23 @@ BenchResult run_gpu_device_api_validation(
     PackedDeviceBuffers buffers(workload);
     GpuTopkScheduler scheduler(opt.streams);
     CUDA_CHECK(cudaDeviceSynchronize());
-    double start = now_ms();
-    for (const auto& request : workload.requests) {
-        DeviceTopkRequest device_request;
-        device_request.keys = buffers.d_keys + request.input_offset;
-        device_request.values = buffers.d_values + request.input_offset;
-        device_request.out_keys = buffers.d_out_keys + request.output_offset;
-        device_request.out_values = buffers.d_out_values + request.output_offset;
-        device_request.groups = request.groups;
-        device_request.group_size = request.group_size;
-        device_request.topk = request.topk;
-        scheduler.submit(device_request);
+    double best_ms = std::numeric_limits<double>::infinity();
+    for (int repeat = 0; repeat < opt.repeats; ++repeat) {
+        double start = now_ms();
+        for (const auto& request : workload.requests) {
+            DeviceTopkRequest device_request;
+            device_request.keys = buffers.d_keys + request.input_offset;
+            device_request.values = buffers.d_values + request.input_offset;
+            device_request.out_keys = buffers.d_out_keys + request.output_offset;
+            device_request.out_values = buffers.d_out_values + request.output_offset;
+            device_request.groups = request.groups;
+            device_request.group_size = request.group_size;
+            device_request.topk = request.topk;
+            scheduler.submit(device_request);
+        }
+        scheduler.synchronize();
+        best_ms = std::min(best_ms, now_ms() - start);
     }
-    scheduler.synchronize();
-    double elapsed = now_ms() - start;
 
     std::vector<float> got_keys(workload.reference_keys.size());
     std::vector<int> got_values(workload.reference_values.size());
@@ -1479,7 +1537,7 @@ BenchResult run_gpu_device_api_validation(
             break;
         }
     }
-    return {"gpu_device_pointer_api", elapsed, valid};
+    return {"gpu_device_pointer_api", best_ms, valid};
 }
 
 // Validate producer-side queueing, bounded pending work, and completion tracking.
@@ -1535,6 +1593,8 @@ PipelineTiming run_gpu_heterogeneous_pipeline(
     const PackedSortWorkload& workload) {
     PipelineTiming best;
     best.total_ms = std::numeric_limits<double>::infinity();
+    // Reuse the scheduler so per-shape choices remain cached after the first run.
+    GpuTopkScheduler scheduler(opt.streams);
     for (int repeat = 0; repeat < opt.repeats; ++repeat) {
         double total_start = now_ms();
         double h2d_start = now_ms();
@@ -1542,7 +1602,6 @@ PipelineTiming run_gpu_heterogeneous_pipeline(
         CUDA_CHECK(cudaDeviceSynchronize());
         double h2d_ms = now_ms() - h2d_start;
 
-        GpuTopkScheduler scheduler(opt.streams);
         double kernel_start = now_ms();
         for (const auto& request : workload.requests) {
             DeviceTopkRequest device_request;

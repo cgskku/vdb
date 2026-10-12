@@ -70,10 +70,13 @@ struct PackedSortWorkload {
     std::vector<SortRequestDescriptor> requests;
 };
 
-// Compare one-stream submission with cost-balanced multi-stream submission.
+// Compare serialized, round-robin, and cost-balanced stream assignment policies.
 struct SchedulerComparison {
     double sequential_ms = 0.0;
     double asynchronous_ms = 0.0;
+    double round_robin_ms = 0.0;
+    double round_robin_load_imbalance = 0.0;
+    double cost_balanced_load_imbalance = 0.0;
     bool valid = true;
 };
 

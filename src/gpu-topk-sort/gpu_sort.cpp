@@ -689,9 +689,16 @@ int run_gpu_sort_demo(int argc, char** argv) {
             }
             SchedulerComparison comparison = run_gpu_heterogeneous_scheduler(opt, workload);
             std::cout << "  packed_one_stream " << comparison.sequential_ms << " ms\n"
-                      << "  packed_async_scheduler " << comparison.asynchronous_ms << " ms\n"
+                      << "  packed_round_robin_scheduler " << comparison.round_robin_ms << " ms\n"
+                      << "  packed_cost_balanced_scheduler " << comparison.asynchronous_ms << " ms\n"
                       << "  scheduler_speedup "
                       << comparison.sequential_ms / comparison.asynchronous_ms << "x\n"
+                      << "  policy_speedup "
+                      << comparison.round_robin_ms / comparison.asynchronous_ms << "x\n"
+                      << "  round_robin_load_imbalance "
+                      << comparison.round_robin_load_imbalance << "x\n"
+                      << "  cost_balanced_load_imbalance "
+                      << comparison.cost_balanced_load_imbalance << "x\n"
                       << "  scheduler_validation "
                       << (comparison.valid ? "pass" : "fail") << "\n";
             BenchResult api_result = run_gpu_device_api_validation(opt, workload);

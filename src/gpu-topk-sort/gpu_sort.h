@@ -75,6 +75,7 @@ struct SchedulerComparison {
     double sequential_ms = 0.0;
     double asynchronous_ms = 0.0;
     double round_robin_ms = 0.0;
+    double fused_ms = 0.0;
     double round_robin_load_imbalance = 0.0;
     double cost_balanced_load_imbalance = 0.0;
     bool valid = true;
@@ -129,6 +130,7 @@ public:
     GpuTopkScheduler(const GpuTopkScheduler&) = delete;
     GpuTopkScheduler& operator=(const GpuTopkScheduler&) = delete;
     void submit(const DeviceTopkRequest& request);
+    void submit_batch(const std::vector<DeviceTopkRequest>& requests);
     void synchronize();
 
 private:

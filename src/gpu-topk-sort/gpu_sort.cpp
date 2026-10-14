@@ -691,6 +691,7 @@ int run_gpu_sort_demo(int argc, char** argv) {
             std::cout << "  packed_one_stream " << comparison.sequential_ms << " ms\n"
                       << "  packed_round_robin_scheduler " << comparison.round_robin_ms << " ms\n"
                       << "  packed_cost_balanced_scheduler " << comparison.asynchronous_ms << " ms\n"
+                      << "  packed_fused_scheduler " << comparison.fused_ms << " ms\n"
                       << "  scheduler_speedup "
                       << comparison.sequential_ms / comparison.asynchronous_ms << "x\n"
                       << "  policy_speedup "

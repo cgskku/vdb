@@ -417,6 +417,63 @@ __global__ void segmented_bitonic_topk_kernel(
     }
 }
 
+// Each block reads an independent row descriptor from a size bucket.
+__global__ void fused_bitonic_topk_kernel(const DeviceTopkRequest* rows) {
+    const DeviceTopkRequest row = rows[blockIdx.x];
+    const float* keys = row.keys;
+    const int* values = row.values;
+    float* out_keys = row.out_keys;
+    int* out_values = row.out_values;
+    int group_size = row.group_size;
+    int topk = row.topk;
+
+    extern __shared__ unsigned char shared_raw[];
+    float* s_keys = reinterpret_cast<float*>(shared_raw);
+    int* s_values = reinterpret_cast<int*>(s_keys + blockDim.x);
+
+    int tid = threadIdx.x;
+    int group = 0;
+    int input_idx = group * group_size + tid;
+
+    if (tid < group_size) {
+        s_keys[tid] = keys[input_idx];
+        s_values[tid] = values[input_idx];
+    } else {
+        s_keys[tid] = INFINITY;
+        s_values[tid] = -1;
+    }
+    __syncthreads();
+
+    for (int k = 2; k <= blockDim.x; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            int ixj = tid ^ j;
+            if (ixj > tid) {
+                bool ascending = ((tid & k) == 0);
+                float a = s_keys[tid];
+                float b = s_keys[ixj];
+                int av = s_values[tid];
+                int bv = s_values[ixj];
+                bool pair_gt = (a > b) || (a == b && av > bv);
+                bool pair_lt = (a < b) || (a == b && av < bv);
+                bool swap = ascending ? pair_gt : pair_lt;
+                if (swap) {
+                    s_keys[tid] = b;
+                    s_keys[ixj] = a;
+                    s_values[tid] = bv;
+                    s_values[ixj] = av;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (tid < topk) {
+        int out_idx = group * topk + tid;
+        out_keys[out_idx] = s_keys[tid];
+        out_values[out_idx] = s_values[tid];
+    }
+}
+
 // Launch bitonic sorting for a contiguous range of segmented groups.
 static void launch_bitonic_range(
     const DeviceBuffers& buffers,
@@ -1143,6 +1200,21 @@ static void launch_packed_request(
     launch_device_request(device_request, radix, stream, algorithm);
 }
 
+// Pinned descriptor storage must outlive asynchronous H2D and kernel execution.
+struct DescriptorStorage {
+    DeviceTopkRequest* host = nullptr;
+    DeviceTopkRequest* device = nullptr;
+    size_t capacity;
+    explicit DescriptorStorage(size_t count) : capacity(count) {
+        CUDA_CHECK(cudaMallocHost(&host, count * sizeof(DeviceTopkRequest)));
+        CUDA_CHECK(cudaMalloc(&device, count * sizeof(DeviceTopkRequest)));
+    }
+    ~DescriptorStorage() {
+        cudaFree(device);
+        cudaFreeHost(host);
+    }
+};
+
 // Keep stream load and per-request radix storage behind the public C++ API.
 struct GpuTopkScheduler::Impl {
     explicit Impl(int stream_count)
@@ -1152,6 +1224,7 @@ struct GpuTopkScheduler::Impl {
     StreamPool pool;
     std::vector<double> loads;
     std::vector<std::unique_ptr<RadixRequestWorkspace>> pending_radix;
+    std::vector<std::unique_ptr<DescriptorStorage>> descriptors;
     std::unordered_map<DeviceShape, DeviceSortAlgorithm, DeviceShapeHash> algorithms;
 };
 
@@ -1204,9 +1277,55 @@ void GpuTopkScheduler::submit(const DeviceTopkRequest& request) {
     impl_->loads[stream_index] += device_request_sort_cost(request);
 }
 
+void GpuTopkScheduler::submit_batch(const std::vector<DeviceTopkRequest>& requests) {
+    std::vector<DeviceTopkRequest> buckets[11];
+    for (const auto& request : requests) {
+        if (!request.keys || !request.values || !request.out_keys || !request.out_values ||
+            request.groups <= 0 || request.group_size <= 0 || request.topk <= 0 ||
+            request.topk > request.group_size || request.topk > GPU_SORT_MAX_TOPK) {
+            throw std::invalid_argument("invalid batched request");
+        }
+        if (request.group_size > 1024) {
+            submit(request);
+            continue;
+        }
+        int power = 0;
+        while ((1 << power) < request.group_size) {
+            ++power;
+        }
+        for (int group = 0; group < request.groups; ++group) {
+            auto row = request;
+            row.keys += static_cast<size_t>(group) * request.group_size;
+            row.values += static_cast<size_t>(group) * request.group_size;
+            row.out_keys += static_cast<size_t>(group) * request.topk;
+            row.out_values += static_cast<size_t>(group) * request.topk;
+            row.groups = 1;
+            buckets[power].push_back(row);
+        }
+    }
+    for (int power = 0; power <= 10; ++power) {
+        if (buckets[power].empty()) {
+            continue;
+        }
+        impl_->descriptors.push_back(std::make_unique<DescriptorStorage>(buckets[power].size()));
+        auto& storage = *impl_->descriptors.back();
+        std::copy(buckets[power].begin(), buckets[power].end(), storage.host);
+        int index = static_cast<int>(std::min_element(impl_->loads.begin(), impl_->loads.end()) - impl_->loads.begin());
+        cudaStream_t stream = impl_->pool.get(index);
+        CUDA_CHECK(cudaMemcpyAsync(storage.device, storage.host,
+            buckets[power].size() * sizeof(DeviceTopkRequest), cudaMemcpyHostToDevice, stream));
+        int threads = 1 << power;
+        fused_bitonic_topk_kernel<<<buckets[power].size(), threads,
+            threads * (sizeof(float) + sizeof(int)), stream>>>(storage.device);
+        CUDA_CHECK(cudaGetLastError());
+        impl_->loads[index] += buckets[power].size() * threads * (power + 1.0);
+    }
+}
+
 void GpuTopkScheduler::synchronize() {
     impl_->pool.synchronize();
     impl_->pending_radix.clear();
+    impl_->descriptors.clear();
     std::fill(impl_->loads.begin(), impl_->loads.end(), 0.0);
 }
 
@@ -1472,6 +1591,33 @@ SchedulerComparison run_gpu_heterogeneous_scheduler(
     comparison.sequential_ms = measure(nullptr);
     comparison.round_robin_ms = measure(&round_robin_assignments);
     comparison.asynchronous_ms = measure(&balanced_assignments);
+    {
+        GpuTopkScheduler fused(opt.streams);
+        std::vector<DeviceTopkRequest> requests;
+        for (const auto& row : workload.requests) {
+            requests.push_back({buffers.d_keys + row.input_offset, buffers.d_values + row.input_offset,
+                buffers.d_out_keys + row.output_offset, buffers.d_out_values + row.output_offset,
+                row.groups, row.group_size, row.topk});
+        }
+        comparison.fused_ms = std::numeric_limits<double>::infinity();
+        for (int repeat = 0; repeat <= opt.repeats; ++repeat) {
+            CUDA_CHECK(cudaMemset(buffers.d_out_values, 0xff, workload.reference_values.size() * sizeof(int)));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            double start = now_ms();
+            fused.submit_batch(requests);
+            fused.synchronize();
+            double elapsed = now_ms() - start;
+            if (repeat > 0) {
+                comparison.fused_ms = std::min(comparison.fused_ms, elapsed);
+            }
+            std::vector<float> keys(workload.reference_keys.size());
+            std::vector<int> values(workload.reference_values.size());
+            copy_to_host(keys, buffers.d_out_keys);
+            copy_to_host(values, buffers.d_out_values);
+            policies_valid = validate_topk(workload.reference_keys, workload.reference_values,
+                keys, values, 1, static_cast<int>(keys.size())) && policies_valid;
+        }
+    }
     comparison.round_robin_load_imbalance = assignment_load_imbalance(
         workload, round_robin_assignments, opt.streams);
     comparison.cost_balanced_load_imbalance = assignment_load_imbalance(

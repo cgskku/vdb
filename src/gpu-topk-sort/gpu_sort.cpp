@@ -819,7 +819,7 @@ int run_gpu_sort_demo(int argc, char** argv) {
         print_graph_pruning_shape(opt);
 
 #if GPU_SORT_HAS_CUDA
-        if (opt.group_size <= 1024) {
+        {
             std::vector<float> scheduler_keys;
             std::vector<int> scheduler_values;
             results.push_back(run_gpu_scheduler(
@@ -856,9 +856,7 @@ int run_gpu_sort_demo(int argc, char** argv) {
 #if GPU_SORT_HAS_CUDA
         std::vector<float> final_keys;
         std::vector<int> final_values;
-        auto final_result = opt.group_size > 1024
-            ? run_gpu_segmented_radix(opt, keys, values, cpu_keys, cpu_values, &final_keys, &final_values)
-            : run_gpu_scheduler(opt, keys, values, cpu_keys, cpu_values, &final_keys, &final_values);
+        auto final_result = run_gpu_scheduler(opt, keys, values, cpu_keys, cpu_values, &final_keys, &final_values);
         if (final_result.valid) {
             write_neighbor_list_preview("neighbor_preview.csv", final_keys, final_values, opt.groups, opt.topk);
             std::cout << "Wrote neighbor_preview.csv for the first 32 groups.\n";

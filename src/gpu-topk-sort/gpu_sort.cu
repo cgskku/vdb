@@ -753,91 +753,82 @@ private:
     std::vector<cudaStream_t> streams_;
 };
 
-// Execute adaptive sort requests over multiple CUDA streams and validate output.
-BenchResult run_gpu_scheduler(
-    const Options& opt,
-    const std::vector<float>& keys,
-    const std::vector<int>& values,
-    const std::vector<float>& ref_keys,
-    const std::vector<int>& ref_values,
-    std::vector<float>* final_keys,
-    std::vector<int>* final_values) {
-    DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
-    auto requests = make_even_requests(opt);
-    double best_ms = std::numeric_limits<double>::infinity();
-    for (int r = 0; r < opt.repeats; ++r) {
-        StreamPool pool(opt.streams);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        double start = now_ms();
-        for (size_t i = 0; i < requests.size(); ++i) {
-            const auto& req = requests[i];
-            launch_adaptive_range(buffers, req.group_size, req.topk, req.group_offset, req.group_count, pool.get(static_cast<int>(i)));
-        }
-        CUDA_CHECK(cudaGetLastError());
-        pool.synchronize();
-        best_ms = std::min(best_ms, now_ms() - start);
+// Submit uniform partitions through the same cached selector as device requests.
+static void submit_uniform(GpuTopkScheduler& scheduler, const DeviceBuffers& buffers,
+                           const Options& opt) {
+    for (const auto& part : make_even_requests(opt)) {
+        size_t input = static_cast<size_t>(part.group_offset) * opt.group_size;
+        size_t output = static_cast<size_t>(part.group_offset) * opt.topk;
+        scheduler.submit({buffers.d_keys + input, buffers.d_values + input,
+            buffers.d_out_keys + output, buffers.d_out_values + output,
+            part.group_count, opt.group_size, opt.topk});
     }
-    std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
-    std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
-    copy_to_host(got_keys, buffers.d_out_keys);
-    copy_to_host(got_values, buffers.d_out_values);
-    bool ok = validate_topk(ref_keys, ref_values, got_keys, got_values, opt.groups, opt.topk);
-    if (final_keys) {
-        *final_keys = got_keys;
-    }
-    if (final_values) {
-        *final_values = got_values;
-    }
-    return {"gpu_async_scheduler_topk", best_ms, ok};
+    scheduler.synchronize();
 }
 
-// Measure allocation, host transfers, scheduled kernels, and validation output separately.
+BenchResult run_gpu_scheduler(
+    const Options& opt, const std::vector<float>& keys, const std::vector<int>& values,
+    const std::vector<float>& ref_keys, const std::vector<int>& ref_values,
+    std::vector<float>* final_keys, std::vector<int>* final_values) {
+    DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
+    GpuTopkScheduler scheduler(opt.streams);
+    submit_uniform(scheduler, buffers, opt);
+    double best = std::numeric_limits<double>::infinity();
+    bool valid = true;
+    std::vector<float> output_keys(ref_keys.size());
+    std::vector<int> output_values(ref_values.size());
+    for (int repeat = 0; repeat < opt.repeats; ++repeat) {
+        double start = now_ms();
+        submit_uniform(scheduler, buffers, opt);
+        best = std::min(best, now_ms() - start);
+        copy_to_host(output_keys, buffers.d_out_keys);
+        copy_to_host(output_values, buffers.d_out_values);
+        valid = validate_topk(ref_keys, ref_values, output_keys, output_values,
+                             opt.groups, opt.topk) && valid;
+    }
+    if (final_keys) {
+        *final_keys = output_keys;
+    }
+    if (final_values) {
+        *final_values = output_values;
+    }
+    return {"gpu_async_scheduler_topk", best, valid};
+}
+
+// Measure warm-cache host-to-host execution; scheduler setup and teardown are excluded.
 PipelineTiming run_gpu_scheduler_pipeline(
-    const Options& opt,
-    const std::vector<float>& keys,
-    const std::vector<int>& values,
-    const std::vector<float>& ref_keys,
-    const std::vector<int>& ref_values) {
+    const Options& opt, const std::vector<float>& keys, const std::vector<int>& values,
+    const std::vector<float>& ref_keys, const std::vector<int>& ref_values) {
+    GpuTopkScheduler scheduler(opt.streams);
+    {
+        DeviceBuffers warmup(keys, values, opt.groups, opt.topk);
+        submit_uniform(scheduler, warmup, opt);
+    }
     PipelineTiming best;
     best.total_ms = std::numeric_limits<double>::infinity();
-    auto requests = make_even_requests(opt);
-
-    for (int r = 0; r < opt.repeats; ++r) {
-        double total_start = now_ms();
-        double h2d_start = now_ms();
+    bool valid = true;
+    for (int repeat = 0; repeat < opt.repeats; ++repeat) {
+        double start = now_ms();
         DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
         CUDA_CHECK(cudaDeviceSynchronize());
-        double h2d_ms = now_ms() - h2d_start;
-
-        StreamPool pool(opt.streams);
-        double kernel_start = now_ms();
-        for (size_t i = 0; i < requests.size(); ++i) {
-            const auto& req = requests[i];
-            launch_adaptive_range(
-                buffers, req.group_size, req.topk, req.group_offset,
-                req.group_count, pool.get(static_cast<int>(i)));
-        }
-        CUDA_CHECK(cudaGetLastError());
-        pool.synchronize();
-        double kernel_ms = now_ms() - kernel_start;
-
-        std::vector<float> got_keys(static_cast<size_t>(opt.groups) * opt.topk);
-        std::vector<int> got_values(static_cast<size_t>(opt.groups) * opt.topk);
-        double d2h_start = now_ms();
+        double transferred = now_ms();
+        submit_uniform(scheduler, buffers, opt);
+        double sorted = now_ms();
+        std::vector<float> got_keys(ref_keys.size());
+        std::vector<int> got_values(ref_values.size());
         copy_to_host(got_keys, buffers.d_out_keys);
         copy_to_host(got_values, buffers.d_out_values);
-        double d2h_ms = now_ms() - d2h_start;
-        double total_ms = now_ms() - total_start;
-
-        if (total_ms < best.total_ms) {
-            best.h2d_ms = h2d_ms;
-            best.kernel_ms = kernel_ms;
-            best.d2h_ms = d2h_ms;
-            best.total_ms = total_ms;
-            best.valid = validate_topk(
-                ref_keys, ref_values, got_keys, got_values, opt.groups, opt.topk);
+        double end = now_ms();
+        valid = validate_topk(ref_keys, ref_values, got_keys, got_values,
+                             opt.groups, opt.topk) && valid;
+        if (end - start < best.total_ms) {
+            best.h2d_ms = transferred - start;
+            best.kernel_ms = sorted - transferred;
+            best.d2h_ms = end - sorted;
+            best.total_ms = end - start;
         }
     }
+    best.valid = valid;
     return best;
 }
 

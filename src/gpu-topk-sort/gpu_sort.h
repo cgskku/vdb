@@ -45,6 +45,7 @@ struct BenchResult {
 
 // Separate transfer, execution, and total latency for end-to-end comparisons.
 struct PipelineTiming {
+    double setup_ms = 0.0;
     double h2d_ms = 0.0;
     double kernel_ms = 0.0;
     double d2h_ms = 0.0;

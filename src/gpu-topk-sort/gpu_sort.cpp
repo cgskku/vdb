@@ -709,7 +709,8 @@ int run_gpu_sort_demo(int argc, char** argv) {
             std::cout << "  " << queue_result.name << " " << queue_result.milliseconds
                       << " ms valid=" << (queue_result.valid ? "yes" : "no") << "\n";
             PipelineTiming pipeline = run_gpu_heterogeneous_pipeline(opt, workload);
-            std::cout << "  gpu_pipeline_h2d " << pipeline.h2d_ms << " ms\n"
+            std::cout << "  gpu_pipeline_setup_once " << pipeline.setup_ms << " ms\n"
+                      << "  gpu_pipeline_h2d " << pipeline.h2d_ms << " ms\n"
                       << "  gpu_pipeline_scheduler " << pipeline.kernel_ms << " ms\n"
                       << "  gpu_pipeline_d2h " << pipeline.d2h_ms << " ms\n"
                       << "  gpu_pipeline_total " << pipeline.total_ms << " ms\n"
@@ -840,6 +841,7 @@ int run_gpu_sort_demo(int argc, char** argv) {
                 opt, keys, values, cpu_keys, cpu_values);
             results.push_back({"gpu_scheduler_end_to_end", pipeline.total_ms, pipeline.valid});
             results.push_back(run_distance_tile_topk_adapter_end_to_end(opt, keys, values));
+            std::cout << "  gpu_pipeline_setup_once " << pipeline.setup_ms << " ms\n";
             std::cout << "End-to-end timing: H2D=" << pipeline.h2d_ms
                       << " ms scheduler_submit_sync=" << pipeline.kernel_ms
                       << " ms D2H=" << pipeline.d2h_ms

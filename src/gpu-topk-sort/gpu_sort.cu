@@ -856,6 +856,7 @@ BenchResult run_gpu_scheduler(
 PipelineTiming run_gpu_scheduler_pipeline(
     const Options& opt, const std::vector<float>& keys, const std::vector<int>& values,
     const std::vector<float>& ref_keys, const std::vector<int>& ref_values) {
+    double setup_start = now_ms();
     GpuTopkScheduler scheduler(opt.streams);
     {
         DeviceBuffers warmup(keys, values, opt.groups, opt.topk);
@@ -864,9 +865,12 @@ PipelineTiming run_gpu_scheduler_pipeline(
     PipelineTiming best;
     best.total_ms = std::numeric_limits<double>::infinity();
     bool valid = true;
+    DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
+    best.setup_ms = now_ms() - setup_start;
     for (int repeat = 0; repeat < opt.repeats; ++repeat) {
         double start = now_ms();
-        DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
+        copy_to_device(buffers.d_keys, keys);
+        copy_to_device(buffers.d_values, values);
         CUDA_CHECK(cudaDeviceSynchronize());
         double transferred = now_ms();
         submit_uniform(scheduler, buffers, opt);
@@ -1225,6 +1229,9 @@ struct GpuTopkScheduler::Impl {
     std::vector<double> loads;
     std::vector<std::unique_ptr<RadixRequestWorkspace>> pending_radix;
     std::vector<std::unique_ptr<DescriptorStorage>> descriptors;
+    size_t descriptor_cursor = 0;
+    std::vector<bool> radix_busy;
+    std::vector<std::pair<int, int>> radix_shapes;
     std::unordered_map<DeviceShape, DeviceSortAlgorithm, DeviceShapeHash> algorithms;
 };
 
@@ -1261,9 +1268,20 @@ void GpuTopkScheduler::submit(const DeviceTopkRequest& request) {
         descriptor.groups = request.groups;
         descriptor.group_size = request.group_size;
         descriptor.topk = request.topk;
-        impl_->pending_radix.push_back(
-            std::make_unique<RadixRequestWorkspace>(descriptor));
-        radix = impl_->pending_radix.back().get();
+        size_t slot = 0;
+        for (; slot < impl_->pending_radix.size(); ++slot) {
+            if (!impl_->radix_busy[slot] &&
+                impl_->radix_shapes[slot] == std::make_pair(request.groups, request.group_size)) {
+                break;
+            }
+        }
+        if (slot == impl_->pending_radix.size()) {
+            impl_->pending_radix.push_back(std::make_unique<RadixRequestWorkspace>(descriptor));
+            impl_->radix_busy.push_back(false);
+            impl_->radix_shapes.emplace_back(request.groups, request.group_size);
+        }
+        impl_->radix_busy[slot] = true;
+        radix = impl_->pending_radix[slot].get();
     }
     DeviceShape key = shape_key(request);
     auto found = impl_->algorithms.find(key);
@@ -1307,8 +1325,13 @@ void GpuTopkScheduler::submit_batch(const std::vector<DeviceTopkRequest>& reques
         if (buckets[power].empty()) {
             continue;
         }
-        impl_->descriptors.push_back(std::make_unique<DescriptorStorage>(buckets[power].size()));
-        auto& storage = *impl_->descriptors.back();
+        size_t slot = impl_->descriptor_cursor++;
+        if (slot == impl_->descriptors.size()) {
+            impl_->descriptors.push_back(std::make_unique<DescriptorStorage>(buckets[power].size()));
+        } else if (impl_->descriptors[slot]->capacity < buckets[power].size()) {
+            impl_->descriptors[slot] = std::make_unique<DescriptorStorage>(buckets[power].size());
+        }
+        auto& storage = *impl_->descriptors[slot];
         std::copy(buckets[power].begin(), buckets[power].end(), storage.host);
         int index = static_cast<int>(std::min_element(impl_->loads.begin(), impl_->loads.end()) - impl_->loads.begin());
         cudaStream_t stream = impl_->pool.get(index);
@@ -1324,8 +1347,8 @@ void GpuTopkScheduler::submit_batch(const std::vector<DeviceTopkRequest>& reques
 
 void GpuTopkScheduler::synchronize() {
     impl_->pool.synchronize();
-    impl_->pending_radix.clear();
-    impl_->descriptors.clear();
+    std::fill(impl_->radix_busy.begin(), impl_->radix_busy.end(), false);
+    impl_->descriptor_cursor = 0;
     std::fill(impl_->loads.begin(), impl_->loads.end(), 0.0);
 }
 
@@ -1731,15 +1754,22 @@ PipelineTiming run_gpu_heterogeneous_pipeline(
     PipelineTiming best;
     best.total_ms = std::numeric_limits<double>::infinity();
     // Reuse the scheduler so per-shape choices remain cached after the first run.
+    double setup_start = now_ms();
     GpuTopkScheduler scheduler(opt.streams);
-    for (int repeat = 0; repeat < opt.repeats; ++repeat) {
+    PackedDeviceBuffers buffers(workload);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    best.setup_ms = now_ms() - setup_start;
+    bool all_valid = true;
+    for (int repeat = -1; repeat < opt.repeats; ++repeat) {
         double total_start = now_ms();
         double h2d_start = now_ms();
-        PackedDeviceBuffers buffers(workload);
+        copy_to_device(buffers.d_keys, workload.keys);
+        copy_to_device(buffers.d_values, workload.values);
         CUDA_CHECK(cudaDeviceSynchronize());
         double h2d_ms = now_ms() - h2d_start;
 
         double kernel_start = now_ms();
+        std::vector<DeviceTopkRequest> batch;
         for (const auto& request : workload.requests) {
             DeviceTopkRequest device_request;
             device_request.keys = buffers.d_keys + request.input_offset;
@@ -1749,8 +1779,9 @@ PipelineTiming run_gpu_heterogeneous_pipeline(
             device_request.groups = request.groups;
             device_request.group_size = request.group_size;
             device_request.topk = request.topk;
-            scheduler.submit(device_request);
+            batch.push_back(device_request);
         }
+        scheduler.submit_batch(batch);
         scheduler.synchronize();
         double kernel_ms = now_ms() - kernel_start;
 
@@ -1770,7 +1801,10 @@ PipelineTiming run_gpu_heterogeneous_pipeline(
                 break;
             }
         }
-        if (total_ms < best.total_ms) {
+        all_valid = valid && all_valid;
+        if (repeat < 0) {
+            best.setup_ms += total_ms;
+        } else if (total_ms < best.total_ms) {
             best.h2d_ms = h2d_ms;
             best.kernel_ms = kernel_ms;
             best.d2h_ms = d2h_ms;
@@ -1778,6 +1812,7 @@ PipelineTiming run_gpu_heterogeneous_pipeline(
             best.valid = valid;
         }
     }
+    best.valid = all_valid;
     return best;
 }
 

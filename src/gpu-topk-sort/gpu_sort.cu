@@ -7,6 +7,8 @@
 #include <cub/device/device_segmented_radix_sort.cuh>
 
 #include <algorithm>
+#include <iostream>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -1357,6 +1359,8 @@ struct GpuTopkCompletion::State {
     mutable std::mutex mutex;
     mutable std::condition_variable completed_cv;
     bool completed = false;
+    double enqueued_ms = now_ms();
+    double finished_ms = 0.0;
     std::exception_ptr error;
 };
 
@@ -1382,6 +1386,12 @@ bool GpuTopkCompletion::ready() const {
     return state_->completed;
 }
 
+double GpuTopkCompletion::latency_ms() const {
+    wait();
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->finished_ms - state_->enqueued_ms;
+}
+
 GpuTopkCompletion::operator bool() const {
     return static_cast<bool>(state_);
 }
@@ -1393,8 +1403,9 @@ struct GpuTopkRequestQueue::Impl {
         std::shared_ptr<GpuTopkCompletion::State> completion;
     };
 
-    Impl(int stream_count, size_t maximum_pending)
-        : scheduler(stream_count), max_pending(std::max<size_t>(1, maximum_pending)) {
+    Impl(int stream_count, size_t maximum_pending, int wait_us, size_t batch_pairs)
+        : scheduler(stream_count), max_pending(std::max<size_t>(1, maximum_pending)),
+          max_wait_us(wait_us), target_pairs(batch_pairs) {
         CUDA_CHECK(cudaGetDevice(&device));
         worker = std::thread([this] { worker_loop(); });
     }
@@ -1423,6 +1434,7 @@ struct GpuTopkRequestQueue::Impl {
         }
         pending.push_back({request, completion});
         ++outstanding;
+        pending_pairs += static_cast<size_t>(request.groups) * request.group_size;
         lock.unlock();
         work_cv.notify_one();
         return completion;
@@ -1457,9 +1469,10 @@ struct GpuTopkRequestQueue::Impl {
                 if (stopping && pending.empty()) {
                     return;
                 }
-                work_cv.wait_for(lock, std::chrono::microseconds(200), [&] {
-                    return stopping || pending.size() >= max_pending;
+                work_cv.wait_for(lock, std::chrono::microseconds(max_wait_us), [&] {
+                    return stopping || pending.size() >= max_pending || pending_pairs >= target_pairs;
                 });
+                pending_pairs = 0;
                 while (!pending.empty()) {
                     batch.push_back(std::move(pending.front()));
                     pending.pop_front();
@@ -1474,9 +1487,11 @@ struct GpuTopkRequestQueue::Impl {
                         return device_request_sort_cost(lhs.request) >
                                device_request_sort_cost(rhs.request);
                     });
+                    std::vector<DeviceTopkRequest> requests;
                     for (const auto& item : batch) {
-                        scheduler.submit(item.request);
+                        requests.push_back(item.request);
                     }
+                    scheduler.submit_batch(requests);
                     scheduler.synchronize();
                 } catch (...) {
                     batch_error = std::current_exception();
@@ -1491,6 +1506,7 @@ struct GpuTopkRequestQueue::Impl {
                 {
                     std::lock_guard<std::mutex> state_lock(item.completion->mutex);
                     item.completion->error = batch_error;
+                    item.completion->finished_ms = now_ms();
                     item.completion->completed = true;
                 }
                 item.completion->completed_cv.notify_all();
@@ -1509,6 +1525,9 @@ struct GpuTopkRequestQueue::Impl {
 
     GpuTopkScheduler scheduler;
     size_t max_pending = 1;
+    int max_wait_us = 20;
+    size_t target_pairs = 65536;
+    size_t pending_pairs = 0;
     int device = 0;
     mutable std::mutex mutex;
     std::condition_variable work_cv;
@@ -1521,8 +1540,9 @@ struct GpuTopkRequestQueue::Impl {
     std::thread worker;
 };
 
-GpuTopkRequestQueue::GpuTopkRequestQueue(int stream_count, size_t max_pending)
-    : impl_(new Impl(stream_count, max_pending)) {}
+GpuTopkRequestQueue::GpuTopkRequestQueue(int stream_count, size_t max_pending,
+                                         int max_wait_us, size_t batch_pairs)
+    : impl_(new Impl(stream_count, max_pending, max_wait_us, batch_pairs)) {}
 
 GpuTopkRequestQueue::~GpuTopkRequestQueue() {
     delete impl_;
@@ -1706,32 +1726,69 @@ BenchResult run_gpu_request_queue_validation(
     const PackedSortWorkload& workload) {
     PackedDeviceBuffers buffers(workload);
     GpuTopkRequestQueue queue(
-        opt.streams, static_cast<size_t>(opt.queue_depth));
+        opt.streams, static_cast<size_t>(opt.queue_depth), opt.queue_wait_us,
+        static_cast<size_t>(opt.queue_batch_pairs));
     CUDA_CHECK(cudaDeviceSynchronize());
 
     double best_ms = std::numeric_limits<double>::infinity();
-    for (int repeat = 0; repeat < opt.repeats; ++repeat) {
-        std::vector<GpuTopkCompletion> completions;
-        completions.reserve(workload.requests.size());
+    std::vector<double> latencies;
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    for (int repeat = -1; repeat < opt.repeats; ++repeat) {
+        std::vector<GpuTopkCompletion> completions(workload.requests.size());
+        std::atomic<size_t> next{0};
+        std::exception_ptr producer_error;
+        std::mutex error_mutex;
         double start = now_ms();
-        for (const auto& request : workload.requests) {
-            DeviceTopkRequest device_request;
-            device_request.keys = buffers.d_keys + request.input_offset;
-            device_request.values = buffers.d_values + request.input_offset;
-            device_request.out_keys = buffers.d_out_keys + request.output_offset;
-            device_request.out_values = buffers.d_out_values + request.output_offset;
-            device_request.groups = request.groups;
-            device_request.group_size = request.group_size;
-            device_request.topk = request.topk;
-            completions.push_back(queue.enqueue(device_request));
+        auto produce = [&] {
+            try {
+                CUDA_CHECK(cudaSetDevice(device));
+                for (;;) {
+                    size_t index = next.fetch_add(1);
+                    if (index >= workload.requests.size()) {
+                        break;
+                    }
+                    const auto& request = workload.requests[index];
+                    completions[index] = queue.enqueue({
+                        buffers.d_keys + request.input_offset, buffers.d_values + request.input_offset,
+                        buffers.d_out_keys + request.output_offset, buffers.d_out_values + request.output_offset,
+                        request.groups, request.group_size, request.topk});
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                producer_error = std::current_exception();
+            }
+        };
+        std::vector<std::thread> producers;
+        if (opt.producers == 1) {
+            produce();
+        } else {
+            for (int index = 0; index < opt.producers; ++index) {
+                producers.emplace_back(produce);
+            }
+            for (auto& thread : producers) {
+                thread.join();
+            }
+        }
+        if (producer_error) {
+            std::rethrow_exception(producer_error);
         }
         for (const auto& completion : completions) {
             completion.wait();
         }
         queue.flush();
-        best_ms = std::min(best_ms, now_ms() - start);
+        if (repeat >= 0) {
+            best_ms = std::min(best_ms, now_ms() - start);
+            for (const auto& completion : completions) {
+                latencies.push_back(completion.latency_ms());
+            }
+        }
     }
-
+    std::sort(latencies.begin(), latencies.end());
+    double mean = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
+    size_t p95 = static_cast<size_t>(std::ceil(latencies.size() * 0.95)) - 1;
+    std::cout << "  queue_latency_mean " << mean << " ms\n"
+              << "  queue_latency_p95 " << latencies[p95] << " ms\n";
     std::vector<float> got_keys(workload.reference_keys.size());
     std::vector<int> got_values(workload.reference_values.size());
     copy_to_host(got_keys, buffers.d_out_keys);

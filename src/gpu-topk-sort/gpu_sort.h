@@ -29,6 +29,9 @@ struct Options {
     bool heterogeneous = false;
     int requests = 10;
     int queue_depth = 8;
+    int queue_wait_us = 20;
+    int queue_batch_pairs = 65536;
+    int producers = 1;
     std::string csv_path;
     std::string keys_bin_path;
     std::string values_bin_path;
@@ -147,6 +150,7 @@ public:
     GpuTopkCompletion() = default;
     void wait() const;
     bool ready() const;
+    double latency_ms() const;
     explicit operator bool() const;
 
 private:
@@ -158,7 +162,8 @@ private:
 // Accept device requests from producer threads and submit bounded batches asynchronously.
 class GpuTopkRequestQueue {
 public:
-    GpuTopkRequestQueue(int stream_count, size_t max_pending);
+    GpuTopkRequestQueue(int stream_count, size_t max_pending, int max_wait_us = 20,
+                        size_t batch_pairs = 65536);
     ~GpuTopkRequestQueue();
     GpuTopkRequestQueue(const GpuTopkRequestQueue&) = delete;
     GpuTopkRequestQueue& operator=(const GpuTopkRequestQueue&) = delete;

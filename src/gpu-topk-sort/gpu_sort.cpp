@@ -21,7 +21,7 @@ void print_usage(const char* prog) {
     std::cout << "Usage: " << prog
               << " [--groups N] [--group-size N] [--topk K] [--streams N] [--repeats N]"
               << " [--csv path] [--keys-bin path] [--values-bin path] [--profile-cpu]"
-              << " [--heterogeneous] [--requests N] [--queue-depth N] [--request-manifest path]\n";
+              << " [--heterogeneous] [--requests N] [--queue-depth N] [--request-manifest path] [--queue-wait-us N] [--queue-batch-pairs N] [--producers N]\n";
 }
 
 // Parse command-line options and normalize invalid benchmark values early.
@@ -68,6 +68,13 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--requests") {
             opt.requests = std::atoi(need_value("--requests"));
         }
+        else if (arg == "--queue-wait-us") {
+            opt.queue_wait_us = std::atoi(need_value("--queue-wait-us"));
+        } else if (arg == "--queue-batch-pairs") {
+            opt.queue_batch_pairs = std::atoi(need_value("--queue-batch-pairs"));
+        } else if (arg == "--producers") {
+            opt.producers = std::atoi(need_value("--producers"));
+        }
         else if (arg == "--queue-depth") {
             opt.queue_depth = std::atoi(need_value("--queue-depth"));
         }
@@ -106,6 +113,9 @@ Options parse_options(int argc, char** argv) {
     }
     if (opt.queue_depth <= 0) {
         throw std::runtime_error("queue-depth must be positive");
+    }
+    if (opt.queue_wait_us < 0 || opt.queue_batch_pairs <= 0 || opt.producers <= 0) {
+        throw std::invalid_argument("invalid queue batching or producer options");
     }
     return opt;
 }

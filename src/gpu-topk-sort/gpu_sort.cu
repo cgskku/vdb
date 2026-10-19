@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cub/device/device_segmented_radix_sort.cuh>
+#include <cub/block/block_radix_sort.cuh>
 
 #include <algorithm>
 #include <iostream>
@@ -543,6 +544,37 @@ __device__ unsigned long long encode_sort_key(float key, int value) {
     return (static_cast<unsigned long long>(ordered_key) << 32) | ordered_value;
 }
 
+// A candidate outside its chunk top-k cannot belong to the global top-k.
+__global__ void chunk_select_kernel(const float* keys, const int* values,
+    int group_size, int topk, int chunks, float* out_keys, int* out_values) {
+    using BlockSort = cub::BlockRadixSort<unsigned long long, 256, 4>;
+    __shared__ typename BlockSort::TempStorage storage;
+    int group = blockIdx.x / chunks;
+    int chunk = blockIdx.x % chunks;
+    unsigned long long items[4];
+    for (int item = 0; item < 4; ++item) {
+        int local = threadIdx.x * 4 + item;
+        int index = chunk * 1024 + local;
+        items[item] = index < group_size
+            ? encode_sort_key(keys[static_cast<size_t>(group) * group_size + index],
+                              values[static_cast<size_t>(group) * group_size + index])
+            : ~0ull;
+    }
+    BlockSort(storage).Sort(items);
+    for (int item = 0; item < 4; ++item) {
+        int rank = threadIdx.x * 4 + item;
+        if (rank < topk) {
+            size_t output = (static_cast<size_t>(group) * chunks + chunk) * topk + rank;
+            unsigned int ordered = static_cast<unsigned int>(items[item] >> 32);
+            unsigned int bits = ordered ^ ((ordered & 0x80000000u) ? 0x80000000u : 0xffffffffu);
+            // Padding must remain a sortable infinity when a tail chunk has fewer than k elements.
+            out_keys[output] = items[item] == ~0ull ? INFINITY : __uint_as_float(bits);
+            out_values[output] = items[item] == ~0ull ? 2147483647
+                : static_cast<int>(static_cast<unsigned int>(items[item]) ^ 0x80000000u);
+        }
+    }
+}
+
 // Encode every input pair before the segmented radix sort.
 __global__ void encode_sort_pairs_kernel(
     const float* keys,
@@ -687,8 +719,21 @@ BenchResult run_gpu_adaptive(
     std::vector<float>* final_keys,
     std::vector<int>* final_values) {
     if (opt.group_size > 1024) {
-        return run_gpu_segmented_radix(
-            opt, keys, values, ref_keys, ref_values, final_keys, final_values);
+        std::vector<float> radix_keys, hierarchical_keys;
+        std::vector<int> radix_values, hierarchical_values;
+        auto radix = run_gpu_segmented_radix(opt, keys, values, ref_keys, ref_values, &radix_keys, &radix_values);
+        auto hierarchical = run_gpu_hierarchical(opt, keys, values, ref_keys, ref_values, &hierarchical_keys, &hierarchical_values);
+        bool use_hierarchy = hierarchical.milliseconds < radix.milliseconds;
+        if (final_keys) {
+            *final_keys = use_hierarchy ? hierarchical_keys : radix_keys;
+        }
+        if (final_values) {
+            *final_values = use_hierarchy ? hierarchical_values : radix_values;
+        }
+        BenchResult best = use_hierarchy ? hierarchical : radix;
+        best.name = "gpu_autotuned_large_topk";
+        best.valid = radix.valid && hierarchical.valid;
+        return best;
     }
     if (opt.group_size <= 128) {
         std::vector<float> insertion_keys;
@@ -970,6 +1015,9 @@ struct RadixRequestWorkspace {
     int* d_offsets = nullptr;
     void* d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
+    float* reduce_keys[2] = {nullptr, nullptr};
+    int* reduce_values[2] = {nullptr, nullptr};
+    size_t reduce_capacity = 0;
 
     explicit RadixRequestWorkspace(const SortRequestDescriptor& request) {
         size_t count = static_cast<size_t>(request.groups) * request.group_size;
@@ -989,7 +1037,24 @@ struct RadixRequestWorkspace {
         CUDA_CHECK(cudaMalloc(&d_temp_storage, temp_storage_bytes));
     }
 
+    void reserve_reduction(int groups, int group_size, int topk) {
+        size_t count = static_cast<size_t>(groups) * ((group_size + 1023) / 1024) * topk;
+        if (count <= reduce_capacity) {
+            return;
+        }
+        for (int index = 0; index < 2; ++index) {
+            CUDA_CHECK(cudaFree(reduce_keys[index]));
+            CUDA_CHECK(cudaFree(reduce_values[index]));
+            reduce_keys[index] = device_alloc<float>(count);
+            reduce_values[index] = device_alloc<int>(count);
+        }
+        reduce_capacity = count;
+    }
     ~RadixRequestWorkspace() {
+        for (int index = 0; index < 2; ++index) {
+            cudaFree(reduce_keys[index]);
+            cudaFree(reduce_values[index]);
+        }
         cudaFree(d_temp_storage);
         cudaFree(d_offsets);
         cudaFree(d_sorted_values);
@@ -1065,7 +1130,8 @@ enum class DeviceSortAlgorithm {
     ParallelInsertion,
     WarpMicro,
     BlockBitonic,
-    SegmentedRadix
+    SegmentedRadix,
+    Hierarchical
 };
 
 struct DeviceShape {
@@ -1122,6 +1188,28 @@ static void launch_device_request(
         return;
     }
 
+    if (algorithm == DeviceSortAlgorithm::Hierarchical) {
+        const float* input_keys = request.keys;
+        const int* input_values = request.values;
+        int size = request.group_size;
+        int ping = 0;
+        for (;;) {
+            int chunks = (size + 1023) / 1024;
+            float* output_keys = chunks == 1 ? request.out_keys : radix->reduce_keys[ping];
+            int* output_values = chunks == 1 ? request.out_values : radix->reduce_values[ping];
+            chunk_select_kernel<<<request.groups * chunks, 256, 0, stream>>>(
+                input_keys, input_values, size, request.topk, chunks, output_keys, output_values);
+            if (chunks == 1) {
+                break;
+            }
+            input_keys = output_keys;
+            input_values = output_values;
+            size = chunks * request.topk;
+            ping ^= 1;
+        }
+        return;
+    }
+
     size_t count = static_cast<size_t>(request.groups) * request.group_size;
     int threads = 256;
     int encode_blocks = static_cast<int>((count + threads - 1) / threads);
@@ -1144,9 +1232,34 @@ static void launch_device_request(
 // Time every feasible small-group kernel and retain the fastest choice for this shape.
 static DeviceSortAlgorithm tune_device_algorithm(
     const DeviceTopkRequest& request,
-    cudaStream_t stream) {
+    cudaStream_t stream, RadixRequestWorkspace* radix = nullptr) {
     if (request.group_size > 1024) {
-        return DeviceSortAlgorithm::SegmentedRadix;
+        if (!radix) {
+            return DeviceSortAlgorithm::SegmentedRadix;
+        }
+        radix->reserve_reduction(request.groups, request.group_size, request.topk);
+        float times[2];
+        const DeviceSortAlgorithm choices[] = {DeviceSortAlgorithm::SegmentedRadix, DeviceSortAlgorithm::Hierarchical};
+        for (int index = 0; index < 2; ++index) {
+            cudaEvent_t start, end;
+            CUDA_CHECK(cudaEventCreate(&start));
+            CUDA_CHECK(cudaEventCreate(&end));
+            times[index] = std::numeric_limits<float>::infinity();
+            for (int repeat = 0; repeat < 4; ++repeat) {
+                CUDA_CHECK(cudaEventRecord(start, stream));
+                launch_device_request(request, radix, stream, choices[index]);
+                CUDA_CHECK(cudaEventRecord(end, stream));
+                CUDA_CHECK(cudaEventSynchronize(end));
+                float ms;
+                CUDA_CHECK(cudaEventElapsedTime(&ms, start, end));
+                if (repeat > 0) {
+                    times[index] = std::min(times[index], ms);
+                }
+            }
+            CUDA_CHECK(cudaEventDestroy(start));
+            CUDA_CHECK(cudaEventDestroy(end));
+        }
+        return choices[times[1] < times[0] ? 1 : 0];
     }
     if (request.group_size > 128) {
         return DeviceSortAlgorithm::BlockBitonic;
@@ -1289,8 +1402,11 @@ void GpuTopkScheduler::submit(const DeviceTopkRequest& request) {
     auto found = impl_->algorithms.find(key);
     if (found == impl_->algorithms.end()) {
         DeviceSortAlgorithm selected = tune_device_algorithm(
-            request, impl_->pool.get(stream_index));
+            request, impl_->pool.get(stream_index), radix);
         found = impl_->algorithms.emplace(key, selected).first;
+    }
+    if (found->second == DeviceSortAlgorithm::Hierarchical) {
+        radix->reserve_reduction(request.groups, request.group_size, request.topk);
     }
     launch_device_request(
         request, radix, impl_->pool.get(stream_index), found->second);
@@ -1595,8 +1711,12 @@ SchedulerComparison run_gpu_heterogeneous_scheduler(
         auto found = algorithm_cache.find(key);
         if (found == algorithm_cache.end()) {
             DeviceSortAlgorithm selected = tune_device_algorithm(
-                device_request, pool.get(0));
+                device_request, pool.get(0), radix_workspaces[algorithms.size()].get());
             found = algorithm_cache.emplace(key, selected).first;
+        }
+        if (found->second == DeviceSortAlgorithm::Hierarchical) {
+            radix_workspaces[algorithms.size()]->reserve_reduction(
+                request.groups, request.group_size, request.topk);
         }
         algorithms.push_back(found->second);
     }
@@ -1919,6 +2039,51 @@ BenchResult run_distance_tile_topk_adapter_end_to_end(
     PipelineTiming pipeline = run_gpu_scheduler_pipeline(
         opt, tile_distances, candidate_ids, ref_keys, ref_values);
     return {"gpu_distance_tile_adapter_total", pipeline.total_ms, pipeline.valid};
+}
+
+BenchResult run_gpu_hierarchical(const Options& opt, const std::vector<float>& keys,
+    const std::vector<int>& values, const std::vector<float>& ref_keys,
+    const std::vector<int>& ref_values, std::vector<float>* final_keys,
+    std::vector<int>* final_values) {
+    DeviceBuffers buffers(keys, values, opt.groups, opt.topk);
+    SortRequestDescriptor shape{0, 0, opt.groups, opt.group_size, opt.topk};
+    RadixRequestWorkspace workspace(shape);
+    workspace.reserve_reduction(opt.groups, opt.group_size, opt.topk);
+    DeviceTopkRequest request{buffers.d_keys, buffers.d_values, buffers.d_out_keys,
+        buffers.d_out_values, opt.groups, opt.group_size, opt.topk};
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    double best = std::numeric_limits<double>::infinity();
+    double best_host = std::numeric_limits<double>::infinity();
+    bool valid = true;
+    std::vector<float> got_keys(ref_keys.size());
+    std::vector<int> got_values(ref_values.size());
+    for (int repeat = -1; repeat < opt.repeats; ++repeat) {
+        double host_start = now_ms();
+        CUDA_CHECK(cudaEventRecord(start));
+        launch_device_request(request, &workspace, 0, DeviceSortAlgorithm::Hierarchical);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float elapsed;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
+        if (repeat >= 0) {
+            best = std::min(best, static_cast<double>(elapsed));
+            best_host = std::min(best_host, now_ms() - host_start);
+        }
+        copy_to_host(got_keys, buffers.d_out_keys);
+        copy_to_host(got_values, buffers.d_out_values);
+        valid = validate_topk(ref_keys, ref_values, got_keys, got_values, opt.groups, opt.topk) && valid;
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    if (final_keys) {
+        *final_keys = got_keys;
+    }
+    if (final_values) {
+        *final_values = got_values;
+    }
+    return {"gpu_hierarchical_topk", best_host, valid, best};
 }
 
 #endif

@@ -814,12 +814,13 @@ int run_gpu_sort_demo(int argc, char** argv) {
             results.push_back(run_gpu_bitonic(opt, keys, values, cpu_keys, cpu_values));
         } else {
             results.push_back(run_gpu_segmented_radix(opt, keys, values, cpu_keys, cpu_values));
+            results.push_back(run_gpu_hierarchical(opt, keys, values, cpu_keys, cpu_values));
         }
 #endif
 
 #if GPU_SORT_HAS_CUDA
         const char* selected_path = opt.group_size > 1024
-            ? "CUB segmented radix"
+            ? "runtime radix/hierarchical autotuning"
             : (opt.group_size <= 128 ? "runtime autotuning" : "bitonic");
         std::cout << "Adaptive dispatcher selected " << selected_path << " for this workload.\n";
         results.push_back(run_gpu_adaptive(opt, keys, values, cpu_keys, cpu_values));

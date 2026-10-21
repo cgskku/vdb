@@ -25,6 +25,11 @@ struct Options {
     int streams = 4;
     int repeats = 3;
     int seed = 1234;
+    bool pipeline_bench = false;
+    int batches = 16;
+    int pipeline_slots = 2;
+    int pipeline_order = 0;
+    std::string pipeline_mode;
     bool profile_cpu = false;
     bool heterogeneous = false;
     int requests = 10;

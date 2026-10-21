@@ -1,5 +1,6 @@
 
 #include "gpu_sort.h"
+#include "pipeline.h"
 
 #if GPU_SORT_HAS_CUDA
 #include <cuda_runtime.h>
@@ -2084,6 +2085,122 @@ BenchResult run_gpu_hierarchical(const Options& opt, const std::vector<float>& k
         *final_values = got_values;
     }
     return {"gpu_hierarchical_topk", best_host, valid, best};
+}
+
+
+struct BoundTopkBatch::Impl {
+    std::vector<DeviceTopkRequest> requests;
+    cudaStream_t stream;
+    bool prepared;
+    std::unique_ptr<DescriptorStorage> descriptors[11];
+    size_t counts[11] = {};
+    struct Large {
+        DeviceTopkRequest request;
+        std::unique_ptr<RadixRequestWorkspace> workspace;
+        DeviceSortAlgorithm algorithm;
+    };
+    std::vector<Large> large;
+
+    std::vector<std::vector<DeviceTopkRequest>> gather() const {
+        std::vector<std::vector<DeviceTopkRequest>> buckets(11);
+        for (const auto& request : requests) {
+            if (request.group_size > 1024) {
+                continue;
+            }
+            int power = 0;
+            while ((1 << power) < request.group_size) {
+                ++power;
+            }
+            for (int group = 0; group < request.groups; ++group) {
+                auto row = request;
+                row.keys += static_cast<size_t>(group) * request.group_size;
+                row.values += static_cast<size_t>(group) * request.group_size;
+                row.out_keys += static_cast<size_t>(group) * request.topk;
+                row.out_values += static_cast<size_t>(group) * request.topk;
+                row.groups = 1;
+                buckets[power].push_back(row);
+            }
+        }
+        return buckets;
+    }
+
+    Impl(const std::vector<DeviceTopkRequest>& input, cudaStream_t execution_stream,
+         const PipelineMode& mode)
+        : requests(input), stream(execution_stream), prepared(mode.prepared) {
+        for (const auto& request : requests) {
+            if (!request.keys || !request.values || !request.out_keys || !request.out_values ||
+                request.groups <= 0 || request.group_size <= 0 || request.topk <= 0 ||
+                request.topk > request.group_size || request.topk > GPU_SORT_MAX_TOPK ||
+                static_cast<size_t>(request.groups) * request.group_size >
+                    static_cast<size_t>(std::numeric_limits<int>::max())) {
+                throw std::invalid_argument("invalid bound batch request");
+            }
+            if (request.group_size > 1024) {
+                SortRequestDescriptor shape{0, 0, request.groups, request.group_size, request.topk};
+                auto workspace = std::make_unique<RadixRequestWorkspace>(shape);
+                auto algorithm = tune_device_algorithm(request, stream, workspace.get());
+                large.push_back({request, std::move(workspace), algorithm});
+            }
+        }
+        auto rows = gather();
+        for (int power = 0; power <= 10; ++power) {
+            counts[power] = rows[power].size();
+            if (counts[power]) {
+                descriptors[power] = std::make_unique<DescriptorStorage>(counts[power]);
+                auto& storage = *descriptors[power];
+                std::copy(rows[power].begin(), rows[power].end(), storage.host);
+                CUDA_CHECK(cudaMemcpyAsync(storage.device, storage.host,
+                    counts[power] * sizeof(DeviceTopkRequest), cudaMemcpyHostToDevice, stream));
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    void enqueue() {
+        std::vector<std::vector<DeviceTopkRequest>> rows;
+        if (!prepared) {
+            rows = gather();
+        }
+        for (int power = 0; power <= 10; ++power) {
+            if (!counts[power]) {
+                continue;
+            }
+            auto& storage = *descriptors[power];
+            if (!prepared) {
+                std::copy(rows[power].begin(), rows[power].end(), storage.host);
+                CUDA_CHECK(cudaMemcpyAsync(storage.device, storage.host,
+                    counts[power] * sizeof(DeviceTopkRequest), cudaMemcpyHostToDevice, stream));
+            }
+            int threads = 1 << power;
+            fused_bitonic_topk_kernel<<<counts[power], threads,
+                threads * (sizeof(float) + sizeof(int)), stream>>>(storage.device);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        for (auto& item : large) {
+            launch_device_request(item.request, item.workspace.get(), stream, item.algorithm);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+};
+
+BoundTopkBatch::BoundTopkBatch(const std::vector<DeviceTopkRequest>& requests,
+                             cudaStream_t stream, const PipelineMode& mode)
+    : impl_(std::make_unique<Impl>(requests, stream, mode)) {}
+BoundTopkBatch::~BoundTopkBatch() {
+    cudaStreamSynchronize(impl_->stream);
+}
+void BoundTopkBatch::enqueue() {
+    impl_->enqueue();
+}
+std::string BoundTopkBatch::description() const {
+    std::ostringstream out;
+    for (int power = 0; power <= 10; ++power) {
+        if (impl_->counts[power]) {
+            out << "bucket" << (1 << power) << "=" << impl_->counts[power] << ":bitonic ";
+        }
+    }
+    out << "large_requests=" << impl_->large.size();
+    return out.str();
 }
 
 #endif

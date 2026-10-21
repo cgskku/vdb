@@ -1,5 +1,6 @@
 
 #include "gpu_sort.h"
+#include "pipeline.h"
 
 #include <algorithm>
 #include <chrono>
@@ -19,7 +20,7 @@
 // Print the supported benchmark arguments for this executable.
 void print_usage(const char* prog) {
     std::cout << "Usage: " << prog
-              << " [--groups N] [--group-size N] [--topk K] [--streams N] [--repeats N]"
+              << " [--pipeline-bench] [--batches N] [--pipeline-slots N] [--pipeline-mode name] [--pipeline-order N] [--groups N] [--group-size N] [--topk K] [--streams N] [--repeats N]"
               << " [--csv path] [--keys-bin path] [--values-bin path] [--profile-cpu]"
               << " [--heterogeneous] [--requests N] [--queue-depth N] [--request-manifest path] [--queue-wait-us N] [--queue-batch-pairs N] [--producers N]\n";
 }
@@ -35,7 +36,17 @@ Options parse_options(int argc, char** argv) {
             }
             return argv[++i];
         };
-        if (arg == "--groups") {
+        if (arg == "--pipeline-bench") {
+            opt.pipeline_bench = true;
+        } else if (arg == "--batches") {
+            opt.batches = std::atoi(need_value("--batches"));
+        } else if (arg == "--pipeline-slots") {
+            opt.pipeline_slots = std::atoi(need_value("--pipeline-slots"));
+        } else if (arg == "--pipeline-order") {
+            opt.pipeline_order = std::atoi(need_value("--pipeline-order"));
+        } else if (arg == "--pipeline-mode") {
+            opt.pipeline_mode = need_value("--pipeline-mode");
+        } else if (arg == "--groups") {
             opt.groups = std::atoi(need_value("--groups"));
         }
         else if (arg == "--group-size") {
@@ -116,6 +127,9 @@ Options parse_options(int argc, char** argv) {
     }
     if (opt.queue_wait_us < 0 || opt.queue_batch_pairs <= 0 || opt.producers <= 0) {
         throw std::invalid_argument("invalid queue batching or producer options");
+    }
+    if (opt.batches < 2 || opt.batches > 1024 || opt.pipeline_slots < 1 || opt.pipeline_slots > 16 || opt.pipeline_order < 0) {
+        throw std::invalid_argument("batches must be 2..1024 and pipeline-slots 1..16");
     }
     return opt;
 }
@@ -676,6 +690,21 @@ static double benchmark_packed_cpu(const PackedSortWorkload& workload, int repea
 int run_gpu_sort_demo(int argc, char** argv) {
     try {
         Options opt = parse_options(argc, argv);
+        if (opt.pipeline_bench) {
+            PackedSortWorkload workload;
+            if (!opt.request_manifest_path.empty()) {
+                workload = load_request_manifest(opt.request_manifest_path);
+            } else if (opt.heterogeneous) {
+                workload = make_heterogeneous_workload(opt);
+            } else {
+                workload.keys = load_or_make_keys(opt);
+                workload.values = load_or_make_values(opt);
+                workload.requests.push_back({0, 0, opt.groups, opt.group_size, opt.topk});
+                cpu_segmented_topk(workload.keys, workload.values, opt.groups, opt.group_size,
+                                   opt.topk, workload.reference_keys, workload.reference_values);
+            }
+            return run_pipeline_experiments(opt, workload);
+        }
         if (opt.heterogeneous || !opt.request_manifest_path.empty()) {
             PackedSortWorkload workload = opt.request_manifest_path.empty()
                 ? make_heterogeneous_workload(opt)

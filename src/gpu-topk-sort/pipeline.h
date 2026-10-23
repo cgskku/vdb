@@ -8,6 +8,7 @@ struct PipelineMode {
     bool pinned = true;
     int slots = 1;
     bool prepared = false;
+    bool adaptive = false;
 };
 
 struct PipelineReport {

@@ -7,6 +7,7 @@
 #include <device_launch_parameters.h>
 #include <cub/device/device_segmented_radix_sort.cuh>
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_reduce.cuh>
 
 #include <algorithm>
 #include <iostream>
@@ -2088,12 +2089,96 @@ BenchResult run_gpu_hierarchical(const Options& opt, const std::vector<float>& k
 }
 
 
+
+template<int CAPACITY>
+__global__ void fused_insertion_kernel(const DeviceTopkRequest* rows, int count) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) {
+        return;
+    }
+    const auto row = rows[index];
+    float keys[CAPACITY];
+    int values[CAPACITY];
+    for (int rank = 0; rank < row.topk; ++rank) {
+        keys[rank] = INFINITY;
+        values[rank] = 2147483647;
+    }
+    for (int candidate = 0; candidate < row.group_size; ++candidate) {
+        float key = row.keys[candidate];
+        int value = row.values[candidate];
+        int position = row.topk - 1;
+        if (key > keys[position] || (key == keys[position] && value >= values[position])) {
+            continue;
+        }
+        while (position > 0 &&
+               (key < keys[position - 1] || (key == keys[position - 1] && value < values[position - 1]))) {
+            keys[position] = keys[position - 1];
+            values[position] = values[position - 1];
+            --position;
+        }
+        keys[position] = key;
+        values[position] = value;
+    }
+    for (int rank = 0; rank < row.topk; ++rank) {
+        row.out_keys[rank] = keys[rank];
+        row.out_values[rank] = values[rank];
+    }
+}
+
+// Composite-key reduction preserves the same distance/ID tie break as sorting.
+__global__ void fused_min_kernel(const DeviceTopkRequest* rows) {
+    using Reduction = cub::BlockReduce<unsigned long long, 128>;
+    __shared__ typename Reduction::TempStorage storage;
+    auto row = rows[blockIdx.x];
+    unsigned long long best = ~0ull;
+    for (int index = threadIdx.x; index < row.group_size; index += blockDim.x) {
+        auto candidate = encode_sort_key(row.keys[index], row.values[index]);
+        best = best < candidate ? best : candidate;
+    }
+    best = Reduction(storage).Reduce(best, cub::Min());
+    if (threadIdx.x == 0) {
+        unsigned int ordered = static_cast<unsigned int>(best >> 32);
+        unsigned int bits = ordered ^ ((ordered & 0x80000000u) ? 0x80000000u : 0xffffffffu);
+        row.out_keys[0] = __uint_as_float(bits);
+        row.out_values[0] = static_cast<int>(static_cast<unsigned int>(best) ^ 0x80000000u);
+    }
+}
+
+__global__ void check_bucket_kernel(const DeviceTopkRequest* rows, int count, int stride,
+    unsigned long long* reference, int* valid, bool capture) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) {
+        return;
+    }
+    auto row = rows[index];
+    for (int rank = 0; rank < row.topk; ++rank) {
+        auto result = encode_sort_key(row.out_keys[rank], row.out_values[rank]);
+        size_t output = static_cast<size_t>(index) * stride + rank;
+        if (capture) {
+            reference[output] = result;
+        } else if (reference[output] != result) {
+            atomicExch(valid, 0);
+        }
+    }
+}
+
+struct TuningEvents {
+    cudaEvent_t start, end;
+    TuningEvents() {
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&end));
+    }
+    ~TuningEvents() { cudaEventDestroy(start); cudaEventDestroy(end); }
+};
+
 struct BoundTopkBatch::Impl {
     std::vector<DeviceTopkRequest> requests;
     cudaStream_t stream;
     bool prepared;
     std::unique_ptr<DescriptorStorage> descriptors[11];
     size_t counts[11] = {};
+    int max_topk[11] = {};
+    int selected[11] = {};
     struct Large {
         DeviceTopkRequest request;
         std::unique_ptr<RadixRequestWorkspace> workspace;
@@ -2145,6 +2230,9 @@ struct BoundTopkBatch::Impl {
         auto rows = gather();
         for (int power = 0; power <= 10; ++power) {
             counts[power] = rows[power].size();
+            for (const auto& row : rows[power]) {
+                max_topk[power] = std::max(max_topk[power], row.topk);
+            }
             if (counts[power]) {
                 descriptors[power] = std::make_unique<DescriptorStorage>(counts[power]);
                 auto& storage = *descriptors[power];
@@ -2154,6 +2242,90 @@ struct BoundTopkBatch::Impl {
             }
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (mode.adaptive) {
+            tune_buckets();
+        }
+    }
+
+
+    void launch_bucket(int power, int algorithm) {
+        auto* rows = descriptors[power]->device;
+        int count = static_cast<int>(counts[power]);
+        int blocks = (count + 127) / 128;
+        if (algorithm == 2) {
+            fused_min_kernel<<<count, 128, 0, stream>>>(rows);
+        } else if (algorithm == 1) {
+            int k = max_topk[power];
+            if (k <= 1) {
+                fused_insertion_kernel<1><<<blocks, 128, 0, stream>>>(rows, count);
+            } else if (k <= 4) {
+                fused_insertion_kernel<4><<<blocks, 128, 0, stream>>>(rows, count);
+            } else if (k <= 8) {
+                fused_insertion_kernel<8><<<blocks, 128, 0, stream>>>(rows, count);
+            } else if (k <= 16) {
+                fused_insertion_kernel<16><<<blocks, 128, 0, stream>>>(rows, count);
+            } else {
+                fused_insertion_kernel<32><<<blocks, 128, 0, stream>>>(rows, count);
+            }
+        } else {
+            int threads = 1 << power;
+            fused_bitonic_topk_kernel<<<count, threads,
+                threads * (sizeof(float) + sizeof(int)), stream>>>(rows);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    void tune_buckets() {
+        TuningEvents events;
+        for (int power = 0; power <= 10; ++power) {
+            if (!counts[power]) {
+                continue;
+            }
+            auto release = [](auto* pointer) { cudaFree(pointer); };
+            std::unique_ptr<unsigned long long, decltype(release)> reference(
+                device_alloc<unsigned long long>(counts[power] * max_topk[power]), release);
+            std::unique_ptr<int, decltype(release)> valid(device_alloc<int>(1), release);
+            launch_bucket(power, 0);
+            check_bucket_kernel<<<(counts[power] + 127) / 128, 128, 0, stream>>>(
+                descriptors[power]->device, static_cast<int>(counts[power]), max_topk[power],
+                reference.get(), valid.get(), true);
+            std::vector<int> choices{0};
+            if (max_topk[power] <= 32) {
+                choices.push_back(1);
+            }
+            if (max_topk[power] == 1) {
+                choices.push_back(2);
+            }
+            double best = std::numeric_limits<double>::infinity();
+            for (int algorithm : choices) {
+                double minimum = std::numeric_limits<double>::infinity();
+                for (int repeat = -1; repeat < 5; ++repeat) {
+                    CUDA_CHECK(cudaEventRecord(events.start, stream));
+                    launch_bucket(power, algorithm);
+                    CUDA_CHECK(cudaEventRecord(events.end, stream));
+                    CUDA_CHECK(cudaEventSynchronize(events.end));
+                    float ms;
+                    CUDA_CHECK(cudaEventElapsedTime(&ms, events.start, events.end));
+                    if (repeat >= 0) {
+                        minimum = std::min(minimum, static_cast<double>(ms));
+                    }
+                }
+                CUDA_CHECK(cudaMemsetAsync(valid.get(), 1, sizeof(int), stream));
+                check_bucket_kernel<<<(counts[power] + 127) / 128, 128, 0, stream>>>(
+                    descriptors[power]->device, static_cast<int>(counts[power]), max_topk[power],
+                    reference.get(), valid.get(), false);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                int correct;
+                CUDA_CHECK(cudaMemcpy(&correct, valid.get(), sizeof(int), cudaMemcpyDeviceToHost));
+                if (!correct) {
+                    throw std::runtime_error("fused autotuning candidate failed validation");
+                }
+                if (minimum < best) {
+                    best = minimum;
+                    selected[power] = algorithm;
+                }
+            }
+        }
     }
 
     void enqueue() {
@@ -2171,10 +2343,7 @@ struct BoundTopkBatch::Impl {
                 CUDA_CHECK(cudaMemcpyAsync(storage.device, storage.host,
                     counts[power] * sizeof(DeviceTopkRequest), cudaMemcpyHostToDevice, stream));
             }
-            int threads = 1 << power;
-            fused_bitonic_topk_kernel<<<counts[power], threads,
-                threads * (sizeof(float) + sizeof(int)), stream>>>(storage.device);
-            CUDA_CHECK(cudaGetLastError());
+            launch_bucket(power, selected[power]);
         }
         for (auto& item : large) {
             launch_device_request(item.request, item.workspace.get(), stream, item.algorithm);
@@ -2196,7 +2365,8 @@ std::string BoundTopkBatch::description() const {
     std::ostringstream out;
     for (int power = 0; power <= 10; ++power) {
         if (impl_->counts[power]) {
-            out << "bucket" << (1 << power) << "=" << impl_->counts[power] << ":bitonic ";
+            out << "bucket" << (1 << power) << "=" << impl_->counts[power] << ":"
+                << (impl_->selected[power] == 0 ? "bitonic" : impl_->selected[power] == 1 ? "insertion" : "min") << " ";
         }
     }
     out << "large_requests=" << impl_->large.size();

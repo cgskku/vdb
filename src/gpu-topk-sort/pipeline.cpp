@@ -49,7 +49,10 @@ int run_pipeline_experiments(const Options& opt, const PackedSortWorkload& workl
         {"prepared_serial", true, 1, true},
         {"prepared_overlap", true, opt.pipeline_slots, true},
         {"adaptive_serial", true, 1, true, true},
-        {"adaptive_overlap", true, opt.pipeline_slots, true, true}
+        {"adaptive_overlap", true, opt.pipeline_slots, true, true},
+        {"graph_serial", true, 1, true, false, true},
+        {"graph_overlap", true, opt.pipeline_slots, true, false, true},
+        {"adaptive_graph_overlap", true, opt.pipeline_slots, true, true, true}
     };
     std::rotate(modes.begin(), modes.begin() + opt.pipeline_order % modes.size(), modes.end());
     bool valid = true;

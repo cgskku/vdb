@@ -8,11 +8,13 @@
 #include <memory>
 #include <stdexcept>
 
-static void check(cudaError_t error) {
+static void check_impl(cudaError_t error, int line) {
     if (error != cudaSuccess) {
-        throw std::runtime_error(cudaGetErrorString(error));
+        throw std::runtime_error(std::string(cudaGetErrorString(error)) + " at pipeline.cu:" + std::to_string(line));
     }
 }
+
+#define check(call) check_impl((call), __LINE__)
 
 template<class T>
 struct Buffer {
@@ -56,6 +58,20 @@ struct BatchEvents {
     Event start, transferred, sorted, done;
     double submitted = 0;
     double observed = 0;
+    double h2d_ms = 0, sort_ms = 0, d2h_ms = 0;
+};
+
+struct Graph {
+    cudaGraph_t definition = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    ~Graph() {
+        if (executable) {
+            cudaGraphExecDestroy(executable);
+        }
+        if (definition) {
+            cudaGraphDestroy(definition);
+        }
+    }
 };
 
 struct Slot {
@@ -63,6 +79,8 @@ struct Slot {
     Buffer<float> host_keys, host_output_keys, device_keys, device_output_keys;
     Buffer<int> host_values, host_output_values, device_values, device_output_values;
     std::unique_ptr<BoundTopkBatch> batch;
+    Event graph_start, graph_transferred, graph_sorted, graph_done;
+    Graph graph;
     int active = -1;
 
     Slot(const PackedSortWorkload& input, const PipelineMode& mode)
@@ -85,6 +103,21 @@ struct Slot {
         batch = std::make_unique<BoundTopkBatch>(requests, stream.value, mode);
     }
     ~Slot() { cudaStreamSynchronize(stream.value); }
+
+    void capture(size_t count, size_t outputs) {
+        check(cudaStreamBeginCapture(stream.value, cudaStreamCaptureModeThreadLocal));
+        check(cudaEventRecordWithFlags(graph_start.value, stream.value, cudaEventRecordExternal));
+        check(cudaMemcpyAsync(device_keys.data, host_keys.data, count*sizeof(float), cudaMemcpyHostToDevice, stream.value));
+        check(cudaMemcpyAsync(device_values.data, host_values.data, count*sizeof(int), cudaMemcpyHostToDevice, stream.value));
+        check(cudaEventRecordWithFlags(graph_transferred.value, stream.value, cudaEventRecordExternal));
+        batch->enqueue();
+        check(cudaEventRecordWithFlags(graph_sorted.value, stream.value, cudaEventRecordExternal));
+        check(cudaMemcpyAsync(host_output_keys.data, device_output_keys.data, outputs*sizeof(float), cudaMemcpyDeviceToHost, stream.value));
+        check(cudaMemcpyAsync(host_output_values.data, device_output_values.data, outputs*sizeof(int), cudaMemcpyDeviceToHost, stream.value));
+        check(cudaEventRecordWithFlags(graph_done.value, stream.value, cudaEventRecordExternal));
+        check(cudaStreamEndCapture(stream.value, &graph.definition));
+        check(cudaGraphInstantiate(&graph.executable, graph.definition, 0));
+    }
 };
 
 static double elapsed(const Event& begin, const Event& end) {
@@ -104,6 +137,9 @@ PipelineReport benchmark_pipeline(const Options& opt,
         slots.push_back(std::make_unique<Slot>(inputs.front(), mode));
         slots.back()->batch->enqueue();
         check(cudaStreamSynchronize(slots.back()->stream.value));
+        if (mode.graph) {
+            slots.back()->capture(count, outputs);
+        }
     }
     std::cout << "PLAN mode=" << mode.name << " " << slots.front()->batch->description() << "\n";
     std::vector<std::unique_ptr<BatchEvents>> events;
@@ -124,6 +160,12 @@ PipelineReport benchmark_pipeline(const Options& opt,
             auto& event = *events[slot.active];
             check(cudaEventSynchronize(event.done.value));
             event.observed = now_ms();
+            event.h2d_ms = mode.graph ? elapsed(slot.graph_start, slot.graph_transferred)
+                                      : elapsed(event.start, event.transferred);
+            event.sort_ms = mode.graph ? elapsed(slot.graph_transferred, slot.graph_sorted)
+                                       : elapsed(event.transferred, event.sorted);
+            event.d2h_ms = mode.graph ? elapsed(slot.graph_sorted, slot.graph_done)
+                                      : elapsed(event.sorted, event.done);
             // Preserve every batch output before the ring slot is reused.
             std::memcpy(saved_keys[slot.active].data(), slot.host_output_keys.data, outputs*sizeof(float));
             std::memcpy(saved_values[slot.active].data(), slot.host_output_values.data, outputs*sizeof(int));
@@ -138,14 +180,18 @@ PipelineReport benchmark_pipeline(const Options& opt,
             event.submitted = now_ms();
             std::memcpy(slot.host_keys.data, input.keys.data(), count*sizeof(float));
             std::memcpy(slot.host_values.data, input.values.data(), count*sizeof(int));
-            check(cudaEventRecord(event.start.value, slot.stream.value));
-            check(cudaMemcpyAsync(slot.device_keys.data, slot.host_keys.data, count*sizeof(float), cudaMemcpyHostToDevice, slot.stream.value));
-            check(cudaMemcpyAsync(slot.device_values.data, slot.host_values.data, count*sizeof(int), cudaMemcpyHostToDevice, slot.stream.value));
-            check(cudaEventRecord(event.transferred.value, slot.stream.value));
-            slot.batch->enqueue();
-            check(cudaEventRecord(event.sorted.value, slot.stream.value));
-            check(cudaMemcpyAsync(slot.host_output_keys.data, slot.device_output_keys.data, outputs*sizeof(float), cudaMemcpyDeviceToHost, slot.stream.value));
-            check(cudaMemcpyAsync(slot.host_output_values.data, slot.device_output_values.data, outputs*sizeof(int), cudaMemcpyDeviceToHost, slot.stream.value));
+            if (mode.graph) {
+                check(cudaGraphLaunch(slot.graph.executable, slot.stream.value));
+            } else {
+                check(cudaEventRecord(event.start.value, slot.stream.value));
+                check(cudaMemcpyAsync(slot.device_keys.data, slot.host_keys.data, count*sizeof(float), cudaMemcpyHostToDevice, slot.stream.value));
+                check(cudaMemcpyAsync(slot.device_values.data, slot.host_values.data, count*sizeof(int), cudaMemcpyHostToDevice, slot.stream.value));
+                check(cudaEventRecord(event.transferred.value, slot.stream.value));
+                slot.batch->enqueue();
+                check(cudaEventRecord(event.sorted.value, slot.stream.value));
+                check(cudaMemcpyAsync(slot.host_output_keys.data, slot.device_output_keys.data, outputs*sizeof(float), cudaMemcpyDeviceToHost, slot.stream.value));
+                check(cudaMemcpyAsync(slot.host_output_values.data, slot.device_output_values.data, outputs*sizeof(int), cudaMemcpyDeviceToHost, slot.stream.value));
+            }
             check(cudaEventRecord(event.done.value, slot.stream.value));
             slot.active = index;
         }
@@ -160,9 +206,9 @@ PipelineReport benchmark_pipeline(const Options& opt,
             if (repeat >= 0) {
                 auto& event = *events[index];
                 latencies.push_back(event.observed - event.submitted);
-                report.h2d_event_ms += elapsed(event.start, event.transferred);
-                report.sort_event_ms += elapsed(event.transferred, event.sorted);
-                report.d2h_event_ms += elapsed(event.sorted, event.done);
+                report.h2d_event_ms += event.h2d_ms;
+                report.sort_event_ms += event.sort_ms;
+                report.d2h_event_ms += event.d2h_ms;
             }
         }
         if (repeat >= 0) {

@@ -9,6 +9,7 @@ struct PipelineMode {
     int slots = 1;
     bool prepared = false;
     bool adaptive = false;
+    bool graph = false;
 };
 
 struct PipelineReport {

@@ -10,6 +10,9 @@ struct PipelineMode {
     bool prepared = false;
     bool adaptive = false;
     bool graph = false;
+    bool tune_chunks = false;
+    int chunk_size = 0;
+    int chunk_threads = 256;
 };
 
 struct PipelineReport {

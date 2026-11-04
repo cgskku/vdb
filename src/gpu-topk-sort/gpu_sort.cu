@@ -1,4 +1,3 @@
-
 #include "gpu_sort.h"
 #include "pipeline.h"
 
@@ -577,6 +576,37 @@ __global__ void chunk_select_kernel(const float* keys, const int* values,
     }
 }
 
+template<int BLOCK_THREADS, int ITEMS_PER_THREAD>
+__global__ void chunk_select_tuned_kernel(const float* keys, const int* values,
+    int group_size, int topk, int chunks, float* out_keys, int* out_values) {
+    using BlockSort = cub::BlockRadixSort<unsigned long long, BLOCK_THREADS, ITEMS_PER_THREAD>;
+    __shared__ typename BlockSort::TempStorage storage;
+    int group = blockIdx.x / chunks;
+    int chunk = blockIdx.x % chunks;
+    unsigned long long items[ITEMS_PER_THREAD];
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        int local = threadIdx.x * ITEMS_PER_THREAD + item;
+        int index = chunk * (BLOCK_THREADS * ITEMS_PER_THREAD) + local;
+        items[item] = index < group_size
+            ? encode_sort_key(keys[static_cast<size_t>(group) * group_size + index],
+                              values[static_cast<size_t>(group) * group_size + index])
+            : ~0ull;
+    }
+    BlockSort(storage).Sort(items);
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        int rank = threadIdx.x * ITEMS_PER_THREAD + item;
+        if (rank < topk) {
+            size_t output = (static_cast<size_t>(group) * chunks + chunk) * topk + rank;
+            unsigned int ordered = static_cast<unsigned int>(items[item] >> 32);
+            unsigned int bits = ordered ^ ((ordered & 0x80000000u) ? 0x80000000u : 0xffffffffu);
+            // Padding must remain a sortable infinity when a tail chunk has fewer than k elements.
+            out_keys[output] = items[item] == ~0ull ? INFINITY : __uint_as_float(bits);
+            out_values[output] = items[item] == ~0ull ? 2147483647
+                : static_cast<int>(static_cast<unsigned int>(items[item]) ^ 0x80000000u);
+        }
+    }
+}
+
 // Encode every input pair before the segmented radix sort.
 __global__ void encode_sort_pairs_kernel(
     const float* keys,
@@ -1039,8 +1069,8 @@ struct RadixRequestWorkspace {
         CUDA_CHECK(cudaMalloc(&d_temp_storage, temp_storage_bytes));
     }
 
-    void reserve_reduction(int groups, int group_size, int topk) {
-        size_t count = static_cast<size_t>(groups) * ((group_size + 1023) / 1024) * topk;
+    void reserve_reduction(int groups, int group_size, int topk, int chunk_size = 1024) {
+        size_t count = static_cast<size_t>(groups) * ((group_size + chunk_size - 1) / chunk_size) * topk;
         if (count <= reduce_capacity) {
             return;
         }
@@ -2171,6 +2201,42 @@ struct TuningEvents {
     ~TuningEvents() { cudaEventDestroy(start); cudaEventDestroy(end); }
 };
 
+
+static void launch_chunk_variant(const DeviceTopkRequest& request,
+    RadixRequestWorkspace& workspace, cudaStream_t stream, int chunk_size, int threads) {
+    const float* keys = request.keys;
+    const int* values = request.values;
+    int size = request.group_size;
+    int ping = 0;
+    for (;;) {
+        int chunks = (size + chunk_size - 1) / chunk_size;
+        float* out_keys = chunks == 1 ? request.out_keys : workspace.reduce_keys[ping];
+        int* out_values = chunks == 1 ? request.out_values : workspace.reduce_values[ping];
+        int blocks = request.groups * chunks;
+        if (chunk_size == 512) {
+            chunk_select_tuned_kernel<128, 4><<<blocks, 128, 0, stream>>>(
+                keys, values, size, request.topk, chunks, out_keys, out_values);
+        } else if (chunk_size == 2048) {
+            chunk_select_tuned_kernel<256, 8><<<blocks, 256, 0, stream>>>(
+                keys, values, size, request.topk, chunks, out_keys, out_values);
+        } else if (threads == 128) {
+            chunk_select_tuned_kernel<128, 8><<<blocks, 128, 0, stream>>>(
+                keys, values, size, request.topk, chunks, out_keys, out_values);
+        } else {
+            chunk_select_tuned_kernel<256, 4><<<blocks, 256, 0, stream>>>(
+                keys, values, size, request.topk, chunks, out_keys, out_values);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        if (chunks == 1) {
+            break;
+        }
+        keys = out_keys;
+        values = out_values;
+        size = chunks * request.topk;
+        ping ^= 1;
+    }
+}
+
 struct BoundTopkBatch::Impl {
     std::vector<DeviceTopkRequest> requests;
     cudaStream_t stream;
@@ -2183,6 +2249,8 @@ struct BoundTopkBatch::Impl {
         DeviceTopkRequest request;
         std::unique_ptr<RadixRequestWorkspace> workspace;
         DeviceSortAlgorithm algorithm;
+        int chunk_size = 0;
+        int threads = 256;
     };
     std::vector<Large> large;
 
@@ -2223,8 +2291,20 @@ struct BoundTopkBatch::Impl {
             if (request.group_size > 1024) {
                 SortRequestDescriptor shape{0, 0, request.groups, request.group_size, request.topk};
                 auto workspace = std::make_unique<RadixRequestWorkspace>(shape);
-                auto algorithm = tune_device_algorithm(request, stream, workspace.get());
-                large.push_back({request, std::move(workspace), algorithm});
+                auto algorithm = mode.tune_chunks || mode.chunk_size
+                    ? DeviceSortAlgorithm::SegmentedRadix
+                    : tune_device_algorithm(request, stream, workspace.get());
+                Large item{request, std::move(workspace), algorithm};
+                if (mode.tune_chunks || mode.chunk_size) {
+                    item.workspace->reserve_reduction(request.groups, request.group_size, request.topk, 512);
+                    if (mode.tune_chunks) {
+                        tune_large(item);
+                    } else {
+                        item.chunk_size = mode.chunk_size;
+                        item.threads = mode.chunk_threads;
+                    }
+                }
+                large.push_back(std::move(item));
             }
         }
         auto rows = gather();
@@ -2247,6 +2327,57 @@ struct BoundTopkBatch::Impl {
         }
     }
 
+
+
+    void launch_large(Large& item) {
+        if (item.chunk_size) {
+            launch_chunk_variant(item.request, *item.workspace, stream, item.chunk_size, item.threads);
+        } else {
+            launch_device_request(item.request, item.workspace.get(), stream, item.algorithm);
+        }
+    }
+
+    void tune_large(Large& item) {
+        TuningEvents events;
+        const std::pair<int, int> choices[] = {{0, 256}, {512, 128}, {1024, 128}, {1024, 256}, {2048, 256}};
+        size_t count = static_cast<size_t>(item.request.groups) * item.request.topk;
+        std::vector<float> reference_keys(count), keys(count);
+        std::vector<int> reference_values(count), values(count);
+        launch_large(item);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        copy_to_host(reference_keys, item.request.out_keys);
+        copy_to_host(reference_values, item.request.out_values);
+        double best = std::numeric_limits<double>::infinity();
+        std::pair<int, int> selected_choice = choices[0];
+        for (auto choice : choices) {
+            item.chunk_size = choice.first;
+            item.threads = choice.second;
+            double minimum = std::numeric_limits<double>::infinity();
+            for (int repeat = -1; repeat < 5; ++repeat) {
+                CUDA_CHECK(cudaEventRecord(events.start, stream));
+                launch_large(item);
+                CUDA_CHECK(cudaEventRecord(events.end, stream));
+                CUDA_CHECK(cudaEventSynchronize(events.end));
+                float ms;
+                CUDA_CHECK(cudaEventElapsedTime(&ms, events.start, events.end));
+                if (repeat >= 0) {
+                    minimum = std::min(minimum, static_cast<double>(ms));
+                }
+            }
+            copy_to_host(keys, item.request.out_keys);
+            copy_to_host(values, item.request.out_values);
+            if (!validate_topk(reference_keys, reference_values, keys, values,
+                               item.request.groups, item.request.topk)) {
+                throw std::runtime_error("chunk autotuning candidate failed validation");
+            }
+            if (minimum < best) {
+                best = minimum;
+                selected_choice = choice;
+            }
+        }
+        item.chunk_size = selected_choice.first;
+        item.threads = selected_choice.second;
+    }
 
     void launch_bucket(int power, int algorithm) {
         auto* rows = descriptors[power]->device;
@@ -2346,7 +2477,7 @@ struct BoundTopkBatch::Impl {
             launch_bucket(power, selected[power]);
         }
         for (auto& item : large) {
-            launch_device_request(item.request, item.workspace.get(), stream, item.algorithm);
+            launch_large(item);
             CUDA_CHECK(cudaGetLastError());
         }
     }
@@ -2370,6 +2501,11 @@ std::string BoundTopkBatch::description() const {
         }
     }
     out << "large_requests=" << impl_->large.size();
+    for (const auto& item : impl_->large) {
+        out << " large" << item.request.group_size << "/k" << item.request.topk
+            << ":chunk" << item.chunk_size << ":threads" << item.threads
+            << ":fallback" << static_cast<int>(item.algorithm);
+    }
     return out.str();
 }
 

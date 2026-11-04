@@ -1,4 +1,3 @@
-
 #include "gpu_sort.h"
 #include "pipeline.h"
 

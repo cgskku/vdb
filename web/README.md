@@ -1,7 +1,7 @@
 # Vector Database Acceleration Project
 
 This repository contains research and implementation details for GPU-accelerated vector database modules.  
-It focuses on high-dimensional vector clustering, distance computation, and efficient GPU memory management.
+It focuses on high-dimensional vector clustering, distance computation, candidate-list sorting, and asynchronous GPU processing.
 
 ---
 
@@ -12,6 +12,9 @@ It focuses on high-dimensional vector clustering, distance computation, and effi
 
 - [Asynchronous Vector Distance & Memory Load Manager](./load_manager.md)  
   Asynchronous CUDA pipeline with dual-stream architecture for large-scale vector distance computation.
+
+- [GPU Top-k Sorting & Asynchronous Task Scheduling](./gpu_sort.md)\
+  Scalable candidate-list sorting with workload-aware scheduling, request batching, and reusable transfer-compute pipelines.
 
 ---
 
